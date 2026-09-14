@@ -8,6 +8,18 @@ version = "0.1.0"
 description = "DWG/DXF → PNG/SVG 渲染管线，用 ODA File Converter + ezdxf 替换 Acme CAD Converter"
 readme = "README.md"
 requires-python = ">=3.8"
+license = {text = "MIT"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
 dependencies = [
     "ezdxf>=1.1.3,<1.2",
     "PyMuPDF>=1.23,<1.25",
@@ -21,11 +33,16 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.0",
     "Pillow>=9.0",      # 测试中读取 PNG 像素校验渲染结果
-    "fonttools>=4.30",  # 仅用于从 .ttc 提取单文件 TTF（字体已生成，按需）
+    "fonttools>=4.30",  # ezdxf 渲染字体时的运行时依赖（ezdxf 自身也会安装）
 ]
 
 [project.scripts]
 cad2image = "cad2image.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/zhy201810576/cad2image"
+Repository = "https://github.com/zhy201810576/cad2image"
+Issues = "https://github.com/zhy201810576/cad2image/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -33,7 +50,7 @@ where = ["src"]
 # 开源字体（Noto Sans SC / Noto Sans Mono，SIL OFL 1.1）与 py.typed 作为包数据随 wheel 分发，
 # 确保安装后中文与 ASCII 渲染开箱即用。
 [tool.setuptools.package-data]
-cad2image = ["py.typed", "fonts/*.otf", "fonts/*.ttf"]
+cad2image = ["py.typed", "fonts/*.otf", "fonts/*.ttf", "fonts/OFL.txt", "fonts/NOTICE"]
 
 [tool.ruff]
 line-length = 120

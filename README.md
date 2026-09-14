@@ -1,5 +1,8 @@
 # cad2image · 让 CAD 图纸渲染告别残余杂线
 
+[![PyPI version](https://img.shields.io/pypi/v/cad2image.svg)](https://pypi.org/project/cad2image/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 用「ODA File Converter + ezdxf」重建 DWG/DXF → PNG/SVG 渲染管线，替换 Acme CAD Converter。
 
 消除 Acme 底层 GDI 栅格化路径产生的「残余杂线」问题——圆弧走真圆弧，无多边形折痕与毛须。
@@ -17,10 +20,14 @@ DWG ──(ODA File Converter, DWG→DXF)──▶ DXF ──(ezdxf.addons.drawi
 
 ## 安装
 
-要求 Python 3.8（ezdxf 1.1.x 为 3.8 可用的最新大版本，且是 PyMuPDF 渲染后端的引入版本）。
+要求 Python 3.8+。
 
 ```bash
-python -m pip install -e ".[dev]"
+# 从 PyPI 安装（推荐）
+pip install cad2image
+
+# 开发安装（含 pytest / ruff / mypy 等）
+pip install -e ".[dev]"
 ```
 
 需要单独安装 ODA File Converter（免费，https://www.opendesign.com/guestfiles/oda_file_converter）。
