@@ -27,7 +27,3 @@ _odatest/
 # 第三方专有安装包（ODA File Converter）
 ODAFileConverter_v21.5.0/
 *.msi
-
-# 微软专有字体：用 scripts/extract_simsun.py 从本机生成，勿提交
-src/cad2image/fonts/simsun.ttf
-src/cad2image/fonts/nsimsun.ttf

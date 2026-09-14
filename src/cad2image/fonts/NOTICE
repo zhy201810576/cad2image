@@ -1,0 +1,6 @@
+本目录下的字体均为开源字体，以 SIL Open Font License 1.1 授权（全文见 OFL.txt）。
+
+- NotoSansSC-Regular.otf  —— Noto Sans SC（Google，源自 Adobe Source Han Sans SC）
+  中文（含拉丁字符），替代微软 SimSun / NSimSun。
+- NotoSansMono-Regular.ttf —— Noto Sans Mono（Google）
+  ASCII 等宽，近似 CAD 单线字体，替代 Autodesk romans.shx / txt.shx 等 SHX 字体。

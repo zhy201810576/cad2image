@@ -30,9 +30,10 @@ cad2image = "cad2image.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# 字体（SHX/TTF）与 py.typed 作为包数据随 wheel 分发，确保安装后中文渲染开箱即用。
+# 开源字体（Noto Sans SC / Noto Sans Mono，SIL OFL 1.1）与 py.typed 作为包数据随 wheel 分发，
+# 确保安装后中文与 ASCII 渲染开箱即用。
 [tool.setuptools.package-data]
-cad2image = ["py.typed", "fonts/*.ttf", "fonts/*.shx"]
+cad2image = ["py.typed", "fonts/*.otf", "fonts/*.ttf"]
 
 [tool.ruff]
 line-length = 120

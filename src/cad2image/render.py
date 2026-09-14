@@ -107,6 +107,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
+    _remap_text_style_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -138,6 +139,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
+    _remap_text_style_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -198,6 +200,66 @@ def _bundled_font_dir() -> Path:
     目录不存在时返回的路径仅用于 ``is_dir`` 判断，调用方据此决定是否扫描。
     """
     return Path(__file__).resolve().parent / "fonts"
+
+
+# 专有字体 → 随包内置的开源字体（SIL OFL 1.1）。ezdxf 按文件名查找字体，
+# 因此只需把文字样式的 font 名重写为内置字体的文件名即可命中。
+_OPEN_CJK_FONT = "NotoSansSC-Regular.otf"  # 中文（含拉丁字符）
+_OPEN_MONO_FONT = "NotoSansMono-Regular.ttf"  # ASCII 等宽，近似 CAD 单线字体
+
+# 中文字体名（微软 SimSun 系 + 常见中文 bigfont SHX），大小写不敏感。
+_CJK_FONT_NAMES = {
+    "simsun",
+    "simsun.ttf",
+    "nsimsun",
+    "nsimsun.ttf",
+    "宋体",
+    "新宋体",
+    # 常见中文 bigfont SHX（ezdxf 本身不支持 bigfont，重写后中文可正常渲染）
+    "hztxt",
+    "hztxt.shx",
+    "gbcbig",
+    "gbcbig.shx",
+    "hzdx",
+    "hzdx.shx",
+    "bigfont",
+    "bigfont.shx",
+}
+
+
+def _map_font_name(font_name: str) -> str:
+    """把专有字体名映射到随包内置的开源字体文件名，未命中原样返回。
+
+    Args:
+        font_name: 文字样式原始 font 名（如 ``"NSimSun.ttf"``、``"romans.shx"``）。
+
+    Returns:
+        内置开源字体文件名；非专有字体名（如 ``"Arial.ttf"``）原样返回，交由字体
+        管理器回退到系统字体。
+    """
+    name = font_name.strip()
+    if not name:
+        return font_name
+    lower = name.lower()
+    if lower in _CJK_FONT_NAMES:
+        return _OPEN_CJK_FONT
+    # 其余 SHX 字形字体（Autodesk 专有：romans/txt/simplex/isocp 等）→ 开源等宽字体。
+    # 与 ezdxf 的 is_shx_font_name 判定一致：以 .shx 结尾，或名字不含点。
+    if lower.endswith(".shx") or "." not in lower:
+        return _OPEN_MONO_FONT
+    return font_name
+
+
+def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
+    """把文档中引用专有字体的文字样式重写为随包内置的开源字体。
+
+    在创建渲染上下文之前调用，确保引用 SimSun / romans / txt 等专有字体的图纸能
+    命中开源替代字体，而不是回退到无中文字形的系统默认字体（中文变方框）。
+    """
+    for style in doc.styles:
+        mapped = _map_font_name(style.dxf.font)
+        if mapped != style.dxf.font:
+            style.dxf.font = mapped
 
 
 def _validate_ctb(ctb: str) -> str:

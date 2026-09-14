@@ -150,7 +150,7 @@ RenderOptions(
 )
 ```
 
-错误统一抛 `FileNotFoundError` / `ValueError` / `RuntimeError`，可放心捕获；中文标注需准备中文字体（见下文「字体与中文」）。
+错误统一抛 `FileNotFoundError` / `ValueError` / `RuntimeError`，可放心捕获；中文与 ASCII 标注随包内置开源字体（见下文「字体与中文」）。
 
 ## Acme 参数映射
 
@@ -205,7 +205,7 @@ python -m pip install dist/cad2image-0.1.0-py3-none-any.whl
 python -m cad2image 轴套.dwg -o 轴套.png
 ```
 
-产物 `dist/cad2image-0.1.0-py3-none-any.whl` 自带 ASCII SHX 字体与 `py.typed`；中文 TTF 因许可原因不随包分发（见下文「字体与中文」），无 `--no-build-isolation` 需要时可用标准 `python -m build` 生成 wheel + sdist。
+产物 `dist/cad2image-0.1.0-py3-none-any.whl` 自带开源字体（Noto Sans SC / Noto Sans Mono）与 `py.typed`，无 `--no-build-isolation` 需要时可用标准 `python -m build` 生成 wheel + sdist。
 
 ## 质量门禁
 
@@ -218,27 +218,23 @@ pytest
 
 ## 字体与中文
 
-渲染时**默认自动扫描**随包内置的 `fonts/` 目录，也可通过 `--font-dir` 追加其它目录。
+渲染时**默认自动扫描**随包内置的 `fonts/` 目录，也可通过 `--font-dir` 追加其它目录。内置字体均为**开源字体（SIL OFL 1.1）**，随仓库与 wheel 一起分发，中文与 ASCII 渲染开箱即用：
 
-`fonts/` 作为包数据随 wheel 一起分发（位于 `src/cad2image/fonts/`），运行时相对包目录定位。仓库内**只内置 ASCII 的 SHX 字体**（`romans.shx`、`txt.shx` 等）；中文 TTF 因微软 SimSun 为专有字体，**不随源码分发**，需自行准备。
+| 字体文件 | 用途 | 许可 |
+|---|---|---|
+| `NotoSansSC-Regular.otf` | 中文（含拉丁字符） | SIL OFL 1.1 |
+| `NotoSansMono-Regular.ttf` | ASCII 等宽，近似 CAD 单线字体 | SIL OFL 1.1 |
 
-### 准备中文字体（必做）
+> 完整许可与署名见 `src/cad2image/fonts/OFL.txt` 与 `NOTICE`。
 
-ODA 转换中文图纸时，文字样式通常引用 `SimSun.ttf`/`NSimSun.ttf`；而 ezdxf 的字体管理器**不索引 `.ttc` 集合**，缺少对应单文件 TTF 时会回退到无中文字形的内置 `arial.ttf`，导致中文显示为方框。请在渲染前生成本机中文字体：
+CAD 图纸的文字样式常引用专有字体（微软 `SimSun`/`NSimSun`、Autodesk `romans.shx`/`txt.shx` 等）。渲染时会自动把这些字体名**重写为内置开源字体**：
 
-```bash
-# 从本机 Windows 的 simsun.ttc 提取 SimSun / NSimSun 单文件 TTF（需 fontTools，含在 [dev] 依赖中）
-python scripts/extract_simsun.py
-```
+- `SimSun` / `NSimSun` / `宋体` / `新宋体` / 中文 bigfont（`hztxt` / `gbcbig` 等）→ `NotoSansSC-Regular.otf`
+- 其余 SHX 字形字体（`romans.shx` / `txt.shx` / `simplex` 等）→ `NotoSansMono-Regular.ttf`
 
-脚本会把 `simsun.ttf`、`nsimsun.ttf` 写入 `src/cad2image/fonts/`，与内置 SHX 一起被默认扫描命中。没有 Windows SimSun 的环境，也可放入任意其它中文字体 TTF，并通过 `--font-dir` 指定。
+> 替换会改变文字外观（SimSun → Noto Sans SC、SHX 单线体 → Noto Sans Mono 等宽），但保证纯开源、无专有字体再分发风险。若需严格保留原字体观感，可自行将对应字体放入 `fonts/` 或通过 `--font-dir` 指定。
 
-> SimSun / NSimSun 为微软专有字体，仅限在本机自有 Windows 许可范围内提取使用，请勿再分发。
-
-**重要限制**：ezdxf 1.1.x 的 `ShapeFile` 解析器**不支持 bigfont 中文大字体**（`HZDX.SHX`/`gbcbig.shx` 等，源码中明确抛出 `UnsupportedShapeFile("BIGFONT shapes are not supported yet")`），且其 drawing 后端只解析文字样式的常规 `font`、不解析 `bigfont`。因此：
-
-- **常规 SHX 字体（ASCII）**：`romans.shx`、`txt.shx` 等可正常渲染。
-- **中文标注**：走 TTF（提取出的 `simsun.ttf`/`nsimsun.ttf`，或系统字体）。若图纸仍引用 SHX bigfont 而非 TTF，建议在 DXF 阶段将文字样式的 `font` 指向 TTF 字体。
+**重要限制**：ezdxf 1.1.x 的 `ShapeFile` 解析器**不支持 bigfont 中文大字体**（`HZDX.SHX`/`gbcbig.shx` 等，源码中明确抛出 `UnsupportedShapeFile("BIGFONT shapes are not supported yet")`），因此本项目不内置 SHX 大字体；引用这类字体的图纸会被自动重写为 `NotoSansSC-Regular.otf`，中文可正常渲染。
 
 ## 已知限制
 
