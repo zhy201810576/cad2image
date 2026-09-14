@@ -1,0 +1,296 @@
+"""DXF → PNG/SVG 渲染核心。
+
+基于 ``ezdxf.addons.drawing``，PNG 走 PyMuPDF 后端（圆弧渲染为真圆弧，无 GDI 毛须），
+SVG 走 ezdxf SVG 后端。渲染流程：
+
+    readfile → 选布局 → 确定页面尺寸 → Configuration → Frontend.draw_layout → 输出
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import ezdxf
+from ezdxf import bbox
+from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
+from ezdxf.addons.drawing import layout as layout_module
+from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
+from ezdxf.addons.drawing.svg import SVGBackend
+from ezdxf.fonts import fonts as ezdxf_fonts
+from ezdxf.layouts import Layout
+from ezdxf.math import Vec2
+
+from cad2image.config import RenderOptions, build_drawing_configuration
+
+_SUPPORTED_IMAGE_FORMATS = {".png"}
+
+# 匹配 XML 声明中的 encoding 属性，用于归一化为 utf-8。
+_XML_ENCODING_RE = re.compile(r"(encoding=)['\"][^'\"]*['\"]")
+
+
+class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
+    """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
+
+    上游 ``Shape.draw_polyline`` 会把原始 ``Vec2`` 直接传给 ``updateRect``，
+    而 ``pymupdf.Rect(Vec2, Vec2)`` 无法解析 ``Vec2``（报 ``float(None)``），
+    导致含 SOLID 箭头（尺寸/引线标注）的图纸渲染崩溃。这里在绘制填充多边形前
+    将顶点转换为普通 tuple 以规避该问题。
+
+    相对线宽基准改用页面较小边（ezdxf 默认用较大边），避免极扁/极长图纸
+    （如 2000x190mm）的线宽被放大得过粗而粘连；且不用 ``int()`` 取整，
+    避免小图线宽被截断到 0。
+    """
+
+    def __init__(self, page: layout_module.Page, settings: layout_module.Settings) -> None:
+        super().__init__(page, settings)
+        smaller_pt = min(page.width_in_mm, page.height_in_mm) * pymupdf.MM_TO_POINTS
+        self.max_stroke_width = max(self.abs_min_stroke_width, smaller_pt * settings.max_stroke_width)
+        self.min_stroke_width = max(self.abs_min_stroke_width, self.max_stroke_width * settings.min_stroke_width)
+
+    def draw_filled_polygon(self, points: NumpyPoints2d, properties: BackendProperties) -> None:
+        vertices: list[Vec2] = points.vertices()
+        if len(vertices) < 3:
+            return
+        shape = self.new_shape()  # type: ignore[no-untyped-call]
+        shape.draw_polyline([(float(v.x), float(v.y)) for v in vertices])
+        self.finish_filling(shape, properties)
+        shape.commit()
+
+
+class _SafePyMuPdfBackend(pymupdf.PyMuPdfBackend):
+    """返回使用 :class:`_SafeRenderBackend` 的 PyMuPDF 后端。"""
+
+    @staticmethod
+    def make_backend(page: layout_module.Page, settings: layout_module.Settings) -> _SafeRenderBackend:
+        return _SafeRenderBackend(page, settings)
+
+
+def render_dxf(dxf_path: str | Path, output_path: str | Path, options: RenderOptions) -> Path:
+    """把 DXF 渲染为 PNG 或 SVG，根据输出文件扩展名自动选择后端。
+
+    Args:
+        dxf_path: 源 DXF 文件路径。
+        output_path: 输出文件路径（``.png`` 或 ``.svg``）。
+        options: 渲染参数。
+
+    Returns:
+        输出文件路径。
+
+    Raises:
+        FileNotFoundError: 当源 DXF 不存在时。
+        ValueError: 当输出扩展名不受支持，或渲染参数非法时。
+        RuntimeError: 当 DXF 解析或渲染失败时。
+    """
+    target = Path(output_path)
+    suffix = target.suffix.lower()
+    if suffix == ".png":
+        return render_to_png(dxf_path, target, options)
+    if suffix == ".svg":
+        return render_to_svg(dxf_path, target, options)
+    raise ValueError(f"不支持的输出格式 '{suffix}'，仅支持 .png / .svg")
+
+
+def render_to_png(dxf_path: str | Path, output_path: str | Path, options: RenderOptions) -> Path:
+    """把 DXF 渲染为 PNG（PyMuPDF 后端）。
+
+    Args:
+        dxf_path: 源 DXF 文件路径。
+        output_path: 输出 PNG 文件路径。
+        options: 渲染参数。
+
+    Returns:
+        输出 PNG 文件路径。
+    """
+    target = Path(output_path)
+    # 必须先扫描字体：bbox 测量文本尺寸时会加载字体，若字体未就绪会回退到内置 arial
+    # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
+    _configure_fonts(options.font_dir)
+    doc = _read_document(dxf_path)
+    dxf_layout = _select_layout(doc, options.layout_name)
+    page = _determine_page(dxf_layout, options)
+    drawing_config = build_drawing_configuration(options)
+
+    context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
+    backend = _SafePyMuPdfBackend()
+    Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    settings = _build_render_settings(options)
+    image_bytes = backend.get_pixmap_bytes(page, fmt="png", dpi=options.dpi, settings=settings)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(image_bytes)
+    return target
+
+
+def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: RenderOptions) -> Path:
+    """把 DXF 渲染为 SVG（ezdxf SVG 后端）。
+
+    Args:
+        dxf_path: 源 DXF 文件路径。
+        output_path: 输出 SVG 文件路径。
+        options: 渲染参数。
+
+    Returns:
+        输出 SVG 文件路径。
+    """
+    target = Path(output_path)
+    # 必须先扫描字体：bbox 测量文本尺寸时会加载字体，若字体未就绪会回退到内置 arial
+    # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
+    _configure_fonts(options.font_dir)
+    doc = _read_document(dxf_path)
+    dxf_layout = _select_layout(doc, options.layout_name)
+    page = _determine_page(dxf_layout, options)
+    drawing_config = build_drawing_configuration(options)
+
+    context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
+    backend = SVGBackend()
+    Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    settings = _build_render_settings(options)
+    svg_string = _normalize_svg_encoding(backend.get_string(page, settings=settings))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(svg_string, encoding="utf-8")
+    return target
+
+
+def _read_document(dxf_path: str | Path) -> ezdxf.document.Drawing:
+    """读取 DXF 文档，缺文件或内容非法时抛出带上下文的异常。"""
+    source = Path(dxf_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"源 DXF 文件不存在：{source}")
+    try:
+        return ezdxf.readfile(str(source))
+    except (ezdxf.DXFError, OSError) as exc:
+        raise RuntimeError(f"无法解析 DXF 文件 {source}：{exc}") from exc
+
+
+def _configure_fonts(font_dir: str) -> None:
+    """把附加字体目录中的 SHX/TTF 字体扫描进 ezdxf 全局字体管理器。
+
+    总是先扫描项目自带的 ``fonts/`` 目录（含从 TTC 提取出的中文字体），再扫描
+    用户通过 ``--font-dir`` 指定的附加目录。扫描是幂等的；字体管理器是进程级
+    单例，扫描后该进程内后续所有渲染都能解析到这些字体。
+
+    Args:
+        font_dir: 附加字体目录路径，空字符串表示仅扫描项目自带 ``fonts/``。
+
+    Raises:
+        FileNotFoundError: 当附加字体目录不存在时。
+    """
+    manager = ezdxf_fonts.font_manager
+    bundled = _bundled_font_dir()
+    if bundled.is_dir():
+        manager.scan_folder(bundled)
+    if not font_dir:
+        return
+    path = Path(font_dir)
+    if not path.is_dir():
+        raise FileNotFoundError(f"字体目录不存在：{path}")
+    manager.scan_folder(path)
+
+
+def _bundled_font_dir() -> Path:
+    """返回随包内置的 ``fonts/`` 目录（含中文字体）。
+
+    字体作为包数据随 wheel 一起分发，目录相对包目录定位（``__file__`` 的父目录），
+    因此在源码、editable 安装与正式安装三种布局下都能命中同一份字体。
+
+    目录不存在时返回的路径仅用于 ``is_dir`` 判断，调用方据此决定是否扫描。
+    """
+    return Path(__file__).resolve().parent / "fonts"
+
+
+def _validate_ctb(ctb: str) -> str:
+    """校验 CTB 打印样式表路径，缺文件时 fail-fast。"""
+    if not ctb:
+        return ""
+    path = Path(ctb)
+    if not path.is_file():
+        raise FileNotFoundError(f"CTB 打印样式表不存在：{path}")
+    return str(path)
+
+
+def _build_render_settings(options: RenderOptions) -> layout_module.Settings:
+    """构建传给 ``get_pixmap_bytes``/``get_string`` 的布局设置。
+
+    相对线宽策略的 ``[min_stroke_width, max_stroke_width]`` 区间在此可配，
+    用于控制线宽随页面缩放的粗细范围。
+    """
+    return layout_module.Settings(
+        max_stroke_width=options.relative_max_stroke_width,
+        min_stroke_width=options.relative_min_stroke_width,
+    )
+
+
+def _normalize_svg_encoding(svg_string: str) -> str:
+    """把 SVG XML 声明中的编码归一化为 utf-8。
+
+    ezdxf 在中文 Windows 上可能产出 ``encoding='cp936'`` 的声明，与后续以
+    utf-8 写盘不一致，这里统一改写为 utf-8。
+    """
+    return _XML_ENCODING_RE.sub(r"\1'utf-8'", svg_string, count=1)
+
+
+def _select_layout(doc: ezdxf.document.Drawing, layout_name: str | None) -> Layout:
+    """选择要渲染的布局：``None`` 表示模型空间，否则按名称查找。"""
+    if layout_name is None:
+        return doc.modelspace()
+    try:
+        return doc.layout(layout_name)
+    except KeyError as exc:
+        available = [layout.name for layout in doc.layouts]
+        raise ValueError(f"布局 '{layout_name}' 不存在，可用布局：{available}") from exc
+
+
+def _determine_page(dxf_layout: Layout, options: RenderOptions) -> layout_module.Page:
+    """确定渲染页面尺寸。
+
+    优先级：显式 ``width_mm/height_mm`` → 图纸空间页面设置 → 内容包围盒自适应。
+    """
+    margins = layout_module.Margins.all(0)
+    if options.width_mm is not None and options.height_mm is not None:
+        if options.width_mm <= 0 or options.height_mm <= 0:
+            raise ValueError(f"页面宽高必须为正数，得到 {options.width_mm} x {options.height_mm}")
+        return layout_module.Page(options.width_mm, options.height_mm, layout_module.Units.mm, margins=margins)
+    if options.width_mm is not None or options.height_mm is not None:
+        raise ValueError("页面宽高（--width / --height）必须同时指定")
+
+    page_from_layout = _page_from_paperspace(dxf_layout)
+    if page_from_layout is not None and not options.fit_to_extents:
+        return page_from_layout
+
+    return _page_from_extents(dxf_layout, options.margin)
+
+
+def _page_from_paperspace(dxf_layout: Layout) -> layout_module.Page | None:
+    """若为图纸空间且定义了页面尺寸，返回对应 Page，否则返回 ``None``。"""
+    if dxf_layout.is_modelspace:
+        return None
+    dxf_layout_obj = dxf_layout.dxf_layout  # 取底层 DXFLayout
+    width = float(dxf_layout_obj.dxf.get("paper_width", 0.0) or 0.0)
+    height = float(dxf_layout_obj.dxf.get("paper_height", 0.0) or 0.0)
+    if width <= 0 or height <= 0:
+        return None
+    # ezdxf 1.1.x 的 stub 将参数声明为 Layout，运行时实际接受 DXFLayout。
+    return layout_module.Page.from_dxf_layout(dxf_layout_obj)  # type: ignore[arg-type]
+
+
+def _page_from_extents(dxf_layout: Layout, margin: float) -> layout_module.Page:
+    """按布局内容包围盒确定页面，四周留百分比余量。
+
+    ``margin`` 为内容较小边长的百分比（0–100）。页面尺寸置 0，交由 ``get_pixmap_bytes``
+    按实际渲染内容（player 的 bbox）自动推导，余量通过 ``Margins`` 表达——这样四周余量
+    均匀，且不受 ``bbox.extents`` 与真实渲染内容之间的偏差影响（``bbox.extents`` 会把
+    某些实体（如文字）估算得过宽，导致显式页面宽度失真、上下贴边）。
+    """
+    extents = bbox.extents(dxf_layout, fast=True)
+    if not extents.has_data:
+        raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
+    width = float(extents.size.x)
+    height = float(extents.size.y)
+    if width <= 0 or height <= 0:
+        raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
+    margin_size = min(width, height) * margin / 100.0
+    return layout_module.Page(
+        0.0, 0.0, layout_module.Units.mm, margins=layout_module.Margins.all(margin_size)
+    )
