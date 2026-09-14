@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cad2image"
-version = "0.1.0"
+version = "0.1.1"
 description = "DWG/DXF → PNG/SVG 渲染管线，用 ODA File Converter + ezdxf 替换 Acme CAD Converter"
 readme = "README.md"
 requires-python = ">=3.8"
