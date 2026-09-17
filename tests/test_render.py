@@ -72,6 +72,19 @@ def test_render_solid_entity_no_crash(solid_dxf: Path, tmp_path: Path) -> None:
     assert output.stat().st_size > 0
 
 
+def test_defer_content_wrap_restores_on_exception() -> None:
+    """渲染加速用的 wrap_contents 禁用必须异常安全，finally 恢复原实现。"""
+    import fitz
+
+    from cad2image.render import _defer_content_wrap
+
+    original = fitz.Page.wrap_contents
+    with pytest.raises(RuntimeError), _defer_content_wrap():
+        assert fitz.Page.wrap_contents is not original
+        raise RuntimeError("boom")
+    assert fitz.Page.wrap_contents is original
+
+
 def test_render_single_dimension_raises(sample_dxf: Path, tmp_path: Path) -> None:
     """仅指定宽度或高度之一时抛出 ValueError。"""
     with pytest.raises(ValueError, match="必须同时指定"):
