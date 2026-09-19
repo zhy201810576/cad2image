@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from cad2image.config import RenderOptions
-from cad2image.render import render_dxf
+from cad2image.render import _bundled_font_dir, render_dxf
 
 
 def test_render_to_png(sample_dxf: Path, tmp_path: Path) -> None:
@@ -180,6 +180,52 @@ def test_render_chinese_text_uses_cjk_font(tmp_path: Path) -> None:
     height = ys.max() - ys.min() + 1
     # "一" 是细横条：宽远大于高；若退化成 .notdef 方框则宽高接近。
     assert width > height * 3, f"中文字形异常：{width}x{height}，疑似 .notdef 方框"
+
+
+def test_bundled_font_contours_use_opposite_winding() -> None:
+    """内置中文字体的封闭字形（如"口"）应外轮廓、内孔轮廓方向相反。
+
+    回归：变量字体实例化出的静态字体会出现所有轮廓同向（非规范），配合 PyMuPDF
+    后端的 even-odd 填充，笔画交叠处会被镂空成"空洞"。经 removeOverlaps 处理后，
+    外轮廓应为顺时针、内孔轮廓应为逆时针。
+    """
+    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.ttLib import TTFont
+
+    font_path = _bundled_font_dir() / "NotoSansSC-Regular.ttf"
+    font = TTFont(font_path)
+    glyph_name = font.getBestCmap()[ord("口")]  # "口"
+    pen = RecordingPen()
+    font.getGlyphSet()[glyph_name].draw(pen)
+
+    contours: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    for op, args in pen.value:
+        if op == "moveTo":
+            if current:
+                contours.append(current)
+            current = [args[0]]
+        elif op in ("lineTo", "curveTo", "qCurveTo"):
+            current.extend(args[1:] if op in ("curveTo", "qCurveTo") else [args[0]])
+        elif op == "closePath":
+            if current:
+                contours.append(current)
+                current = []
+    if current:
+        contours.append(current)
+
+    areas = []
+    for contour in contours:
+        area = 0.0
+        for i in range(len(contour)):
+            x1, y1 = contour[i]
+            x2, y2 = contour[(i + 1) % len(contour)]
+            area += x1 * y2 - x2 * y1
+        areas.append(area)
+
+    assert any(a > 0 for a in areas) and any(a < 0 for a in areas), (
+        f"内置字体 '口' 字形轮廓方向应相反（外 CW、内 CCW），实际面积：{areas}"
+    )
 
 
 def test_relative_stroke_width_uses_smaller_dimension() -> None:
