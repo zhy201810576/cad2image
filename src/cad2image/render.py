@@ -31,6 +31,14 @@ _SUPPORTED_IMAGE_FORMATS = {".png"}
 # 匹配 XML 声明中的 encoding 属性，用于归一化为 utf-8。
 _XML_ENCODING_RE = re.compile(r"(encoding=)['\"][^'\"]*['\"]")
 
+# 匹配 ODA 输出的多字节转义 \M+nXXXX（GBK hex）。ODA File Converter 在 Linux 上处理
+# CAD2000 老版本 DWG 时，中文会以 \M+5XXXX 形式输出 GBK 字节（5 为字节数前缀，
+# XXXX 是 GBK 双字节的十六进制）；ezdxf 不认识 M 转义，会原样渲染成乱码。
+_M_PLUS_ESCAPE_RE = re.compile(r"\\[Mm]\+([0-9A-Fa-f]{4,5})")
+
+# 需要解码多字节转义的文字实体类型。
+_TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
+
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
     """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
@@ -133,6 +141,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
+    _decode_multibyte_text(doc)
     _remap_text_style_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
@@ -166,6 +175,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     # 并被全局字体管理器缓存，导致后续（含中文字体）全部失效。
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
+    _decode_multibyte_text(doc)
     _remap_text_style_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
@@ -287,6 +297,47 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
         mapped = _map_font_name(style.dxf.font)
         if mapped != style.dxf.font:
             style.dxf.font = mapped
+
+
+def _decode_multibyte_escapes(text: str) -> str:
+    """把 ODA 的多字节转义 ``\\M+nXXXX`` 解码为 Unicode 汉字。
+
+    ODA File Converter 在 Linux 上处理 CAD2000 老版本 DWG 时，中文文本会以
+    ``\\M+5XXXX`` 形式输出 GBK 字节（``5`` 为字节数前缀，``XXXX`` 是 GBK 双字节
+    的十六进制）。ezdxf 的 MTEXT 解析器不识别 ``M`` 转义，会原样渲染成乱码。
+    这里在渲染前把转义解码为真正的汉字。
+
+    Args:
+        text: 含 ``\\M+XXXX`` 转义的原始文本。
+
+    Returns:
+        解码后的文本；无法解码的转义原样保留。
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        hexstr = match.group(1)
+        if len(hexstr) == 5 and hexstr[0] in "0123456789":
+            hexstr = hexstr[1:]  # 去掉 ODA 的字节数前缀
+        try:
+            return bytes.fromhex(hexstr).decode("gbk")
+        except (ValueError, UnicodeDecodeError):
+            return match.group(0)
+
+    return _M_PLUS_ESCAPE_RE.sub(replace, text)
+
+
+def _decode_multibyte_text(doc: ezdxf.document.Drawing) -> None:
+    """解码文档内所有文字实体的多字节转义（见 :func:`_decode_multibyte_escapes`）。"""
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() not in _TEXT_ENTITIES:
+                continue
+            raw = entity.dxf.get("text", "")
+            if not raw:
+                continue
+            decoded = _decode_multibyte_escapes(raw)
+            if decoded != raw:
+                entity.dxf.text = decoded
 
 
 def _validate_ctb(ctb: str) -> str:

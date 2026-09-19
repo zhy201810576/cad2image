@@ -85,6 +85,29 @@ def test_defer_content_wrap_restores_on_exception() -> None:
     assert fitz.Page.wrap_contents is original
 
 
+def test_decode_multibyte_escapes_oda_format() -> None:
+    """ODA 的多字节转义 \\M+5XXXX（5 为前缀，XXXX 是 GBK 双字节）应解码为汉字。"""
+    from cad2image.render import _decode_multibyte_escapes
+
+    assert _decode_multibyte_escapes("\\M+5B7C0\\M+5B7B4\\M+5BFD7") == "防反孔"
+
+
+def test_decode_multibyte_escapes_standard_format() -> None:
+    """标准 \\M+XXXX（4 hex）也应解码为汉字。"""
+    from cad2image.render import _decode_multibyte_escapes
+
+    assert _decode_multibyte_escapes("\\M+B7C0") == "防"
+
+
+def test_decode_multibyte_escapes_keeps_invalid_and_plain() -> None:
+    """无法解码的转义与普通文本原样保留。"""
+    from cad2image.render import _decode_multibyte_escapes
+
+    assert _decode_multibyte_escapes("\\M+ZZZZ") == "\\M+ZZZZ"
+    assert _decode_multibyte_escapes("ABC123") == "ABC123"
+    assert _decode_multibyte_escapes("") == ""
+
+
 def test_render_single_dimension_raises(sample_dxf: Path, tmp_path: Path) -> None:
     """仅指定宽度或高度之一时抛出 ValueError。"""
     with pytest.raises(ValueError, match="必须同时指定"):
