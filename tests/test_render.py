@@ -136,7 +136,7 @@ def test_render_chinese_text_uses_cjk_font(tmp_path: Path) -> None:
     """中文字形应渲染为真实笔画（细横条），而非 ``.notdef`` 方框。
 
     回归：字体必须扫描在 bbox 测量之前；且引用 ``NSimSun.ttf`` 的中文样式会被
-    自动重写为内置开源字体 ``NotoSansSC-Regular.otf``，避免中文变成方框。
+    自动重写为内置开源字体 ``NotoSansSC-Regular.ttf``，避免中文变成方框。
     """
     import ezdxf
     import numpy as np
