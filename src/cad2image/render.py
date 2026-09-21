@@ -9,6 +9,7 @@ SVG 走 ezdxf SVG 后端。渲染流程：
 from __future__ import annotations
 
 import re
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -77,6 +78,19 @@ class _SafePyMuPdfBackend(pymupdf.PyMuPdfBackend):
         return _SafeRenderBackend(page, settings)
 
 
+# 线程安全：``_defer_content_wrap`` 会临时替换进程级全局的 ``fitz.Page.wrap_contents``。
+# 用引用计数 + 锁让并发渲染共享同一补丁：首个进入者捕获原实现并打补丁，最后一个退出者
+# 恢复原实现；中间并发进入者只递增计数，互不干扰，使同进程多线程并发渲染成为可能。
+_wrap_contents_lock = threading.RLock()
+_wrap_contents_refcount = 0
+_wrap_contents_original: object | None = None
+
+
+def _no_op_wrap_contents(*_args: object, **_kwargs: object) -> None:
+    """``wrap_contents`` 的 no-op 替代实现（仅光栅化期间启用）。"""
+    return None
+
+
 @contextmanager
 def _defer_content_wrap() -> Iterator[None]:
     """渲染光栅化期间禁用 PyMuPDF 的内容流平衡扫描。
@@ -88,16 +102,23 @@ def _defer_content_wrap() -> Iterator[None]:
     本身已平衡，因此该扫描是纯开销——逐字节比对下输出完全一致，却可提速约 2.5 倍，
     且实体越多收益越大。
 
-    Note:
-        此优化修改进程级全局状态（``fitz.Page``），非线程安全。同一进程内的并发
-        渲染应改用多进程隔离（批量场景本就推荐进程池）。
+    线程安全：引用计数 + 锁共享补丁（见模块级 ``_wrap_contents_*``），首个进入者
+    打补丁、最后一个退出者恢复，同进程内多个线程可并发进入而不互相踩踏。
     """
-    original = fitz.Page.wrap_contents
-    fitz.Page.wrap_contents = lambda self: None
+    global _wrap_contents_refcount, _wrap_contents_original
+    with _wrap_contents_lock:
+        if _wrap_contents_refcount == 0:
+            _wrap_contents_original = fitz.Page.wrap_contents
+            fitz.Page.wrap_contents = _no_op_wrap_contents
+        _wrap_contents_refcount += 1
     try:
         yield
     finally:
-        fitz.Page.wrap_contents = original
+        with _wrap_contents_lock:
+            _wrap_contents_refcount -= 1
+            if _wrap_contents_refcount == 0:
+                fitz.Page.wrap_contents = _wrap_contents_original
+                _wrap_contents_original = None
 
 
 def render_dxf(dxf_path: str | Path, output_path: str | Path, options: RenderOptions) -> Path:
@@ -203,12 +224,22 @@ def _read_document(dxf_path: str | Path) -> ezdxf.document.Drawing:
         raise RuntimeError(f"无法解析 DXF 文件 {source}：{exc}") from exc
 
 
+# 线程安全：ezdxf 字体管理器是进程级单例，``scan_folder`` 会重建其索引，并发扫描
+# 不安全。用锁 + 已扫描目录集合，使每个目录只扫描一次（幂等且线程安全），避免并发
+# 渲染时多线程同时 scan_folder 互相踩踏。字体目录在进程生命周期内通常不变，一次即可。
+_font_scan_lock = threading.Lock()
+_scanned_font_dirs: set[Path] = set()
+
+
 def _configure_fonts(font_dir: str) -> None:
     """把附加字体目录中的 SHX/TTF 字体扫描进 ezdxf 全局字体管理器。
 
     总是先扫描项目自带的 ``fonts/`` 目录（含从 TTC 提取出的中文字体），再扫描
-    用户通过 ``--font-dir`` 指定的附加目录。扫描是幂等的；字体管理器是进程级
-    单例，扫描后该进程内后续所有渲染都能解析到这些字体。
+    用户通过 ``--font-dir`` 指定的附加目录。字体管理器是进程级单例，扫描后该进程内
+    后续所有渲染都能解析到这些字体。
+
+    线程安全：扫描加锁且每个目录只扫一次（见模块级 ``_font_scan_lock`` /
+    ``_scanned_font_dirs``），并发渲染安全；附加目录不存在时仍每次校验并抛错。
 
     Args:
         font_dir: 附加字体目录路径，空字符串表示仅扫描项目自带 ``fonts/``。
@@ -218,14 +249,19 @@ def _configure_fonts(font_dir: str) -> None:
     """
     manager = ezdxf_fonts.font_manager
     bundled = _bundled_font_dir()
+    dirs: list[Path] = []
     if bundled.is_dir():
-        manager.scan_folder(bundled)
-    if not font_dir:
-        return
-    path = Path(font_dir)
-    if not path.is_dir():
-        raise FileNotFoundError(f"字体目录不存在：{path}")
-    manager.scan_folder(path)
+        dirs.append(bundled)
+    if font_dir:
+        path = Path(font_dir)
+        if not path.is_dir():
+            raise FileNotFoundError(f"字体目录不存在：{path}")
+        dirs.append(path.resolve())
+    with _font_scan_lock:
+        for directory in dirs:
+            if directory not in _scanned_font_dirs:
+                manager.scan_folder(directory)
+                _scanned_font_dirs.add(directory)
 
 
 def _bundled_font_dir() -> Path:

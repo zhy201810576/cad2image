@@ -85,6 +85,46 @@ def test_defer_content_wrap_restores_on_exception() -> None:
     assert fitz.Page.wrap_contents is original
 
 
+def test_defer_content_wrap_is_thread_safe() -> None:
+    """并发进入 _defer_content_wrap 共享同一补丁，最后一个退出才恢复原实现。"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import fitz
+
+    from cad2image.render import _defer_content_wrap
+
+    original = fitz.Page.wrap_contents
+    barrier = threading.Barrier(4)
+
+    def worker(_: int) -> bool:
+        with _defer_content_wrap():
+            barrier.wait()  # 确保 4 线程同时处于补丁生效区间
+            return fitz.Page.wrap_contents is not original
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(worker, range(4)))
+
+    assert all(results)
+    assert fitz.Page.wrap_contents is original
+
+
+def test_concurrent_render_no_cross_contamination(sample_dxf: Path, tmp_path: Path) -> None:
+    """多线程并发渲染同一 DXF 应全部成功且输出一致（无全局状态交叉污染）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def render(i: int) -> int:
+        out = tmp_path / f"out_{i}.png"
+        render_dxf(sample_dxf, out, RenderOptions(dpi=100))
+        return out.stat().st_size
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sizes = list(pool.map(render, range(8)))
+
+    assert all(s > 0 for s in sizes)
+    assert len(set(sizes)) == 1, f"并发渲染输出尺寸不一致：{sizes}"
+
+
 def test_decode_multibyte_escapes_oda_format() -> None:
     """ODA 的多字节转义 \\M+5XXXX（5 为前缀，XXXX 是 GBK 双字节）应解码为汉字。"""
     from cad2image.render import _decode_multibyte_escapes
