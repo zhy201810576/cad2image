@@ -40,6 +40,11 @@ _M_PLUS_ESCAPE_RE = re.compile(r"\\[Mm]\+([0-9A-Fa-f]{4,5})")
 # 需要解码多字节转义的文字实体类型。
 _TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
+# 匹配 MTEXT 内联字体覆盖 \fXXX / \FXXX（XXX 为字体名，后跟可选的 |flags;）。
+# 部分图纸用内联 \fNSimSun 覆盖样式字体，ezdxf 找不到该专有字体时回退，导致
+# 其中的西文/直径符号等变方框，需一并重写为内置字体。
+_INLINE_FONT_RE = re.compile(r"(\\[fF])([^;|]*)")
+
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
     """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
@@ -164,6 +169,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
     _remap_text_style_fonts(doc)
+    _remap_mtext_inline_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -198,6 +204,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
     _remap_text_style_fonts(doc)
+    _remap_mtext_inline_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -341,6 +348,35 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
         mapped = _map_font_name(style.dxf.font)
         if mapped != style.dxf.font:
             style.dxf.font = mapped
+
+
+def _remap_inline_font(match: re.Match[str]) -> str:
+    """重写单个 MTEXT 内联字体覆盖：``\\fNSimSun`` → ``\\f内置字体``。"""
+    prefix = match.group(1)  # \f 或 \F
+    font_name = match.group(2)
+    mapped = _map_font_name(font_name)
+    if mapped == font_name:
+        return match.group(0)  # 未命中映射，原样保留
+    return f"{prefix}{mapped}"
+
+
+def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
+    """把 MTEXT 内联字体覆盖（``\\fXXX``）也重写为内置字体。
+
+    部分图纸的 MTEXT 用内联 ``\\fNSimSun`` 等覆盖样式字体，ezdxf 找不到该专有字体
+    时回退到无该字形的默认字体，导致其中的西文/直径符号等变方框。这里把内联字体名
+    一并映射到内置字体（与样式字体 remap 规则一致）。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() != "MTEXT":
+                continue
+            raw = entity.dxf.get("text", "")
+            if not raw or "\\f" not in raw.lower():
+                continue
+            new = _INLINE_FONT_RE.sub(_remap_inline_font, raw)
+            if new != raw:
+                entity.dxf.text = new
 
 
 def _decode_multibyte_escapes(text: str) -> str:

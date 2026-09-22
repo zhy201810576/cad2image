@@ -235,6 +235,34 @@ def test_map_font_name_empty_and_chinese_names() -> None:
     assert _map_font_name("Arial.ttf") == "Arial.ttf"
 
 
+def test_remap_mtext_inline_fonts() -> None:
+    """MTEXT 内联 \\fNSimSun 覆盖应重写为内置字体，其余内容保留。"""
+    import ezdxf
+
+    from cad2image.render import _remap_mtext_inline_fonts
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_mtext(r"{\fNSimSun|b0|i0|c134|p49;\W1;Y}")
+    _remap_mtext_inline_fonts(doc)
+
+    text = list(doc.modelspace())[0].dxf.text
+    assert "NSimSun" not in text
+    assert "SourceHanSerifSC-Regular.ttf" in text
+    assert r"\W1;Y" in text  # 非字体部分原样保留
+
+
+def test_remap_mtext_inline_fonts_keeps_unmapped() -> None:
+    """内联字体名无需映射时（如 Arial）原样保留。"""
+    import ezdxf
+
+    from cad2image.render import _remap_mtext_inline_fonts
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_mtext(r"{\fArial.ttf;ABC}")
+    _remap_mtext_inline_fonts(doc)
+    assert r"{\fArial.ttf;ABC}" in list(doc.modelspace())[0].dxf.text
+
+
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
     """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
     import ezdxf
