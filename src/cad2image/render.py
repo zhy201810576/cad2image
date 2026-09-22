@@ -300,6 +300,11 @@ _CJK_FONT_NAMES = {
 }
 
 
+def _contains_cjk(text: str) -> bool:
+    """判断字符串是否含 CJK 汉字（用于识别中文字体名，如"仿宋_GB2312"/"黑体"）。"""
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
 def _map_font_name(font_name: str) -> str:
     """把专有字体名映射到随包内置的开源字体文件名，未命中原样返回。
 
@@ -312,9 +317,12 @@ def _map_font_name(font_name: str) -> str:
     """
     name = font_name.strip()
     if not name:
-        return font_name
+        # 部分 ODA 版本转出的文字样式 font 为空。此时无从判断中西文，而内置中文
+        # 字体同时含 CJK 与拉丁字形，作为兜底最安全（否则 ezdxf 回退到无中文字形
+        # 的 arial，中文变方框）。
+        return _OPEN_CJK_FONT
     lower = name.lower()
-    if lower in _CJK_FONT_NAMES:
+    if lower in _CJK_FONT_NAMES or _contains_cjk(name):
         return _OPEN_CJK_FONT
     # 其余 SHX 字形字体（Autodesk 专有：romans/txt/simplex/isocp 等）→ 开源等宽字体。
     # 与 ezdxf 的 is_shx_font_name 判定一致：以 .shx 结尾，或名字不含点。

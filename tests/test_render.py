@@ -222,6 +222,41 @@ def test_render_chinese_text_uses_cjk_font(tmp_path: Path) -> None:
     assert width > height * 3, f"中文字形异常：{width}x{height}，疑似 .notdef 方框"
 
 
+def test_map_font_name_empty_and_chinese_names() -> None:
+    """空字体名与含中文的字体名应映射到内置中文字体，而非等宽或原样。"""
+    from cad2image.render import _map_font_name
+
+    assert _map_font_name("") == "NotoSansSC-Regular.ttf"
+    assert _map_font_name("   ") == "NotoSansSC-Regular.ttf"
+    assert _map_font_name("仿宋_GB2312") == "NotoSansSC-Regular.ttf"
+    assert _map_font_name("黑体") == "NotoSansSC-Regular.ttf"
+    # 非中文字体名不受影响
+    assert _map_font_name("romans.shx") == "NotoSansMono-Regular.ttf"
+    assert _map_font_name("Arial.ttf") == "Arial.ttf"
+
+
+def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
+    """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
+    import ezdxf
+    import numpy as np
+    from PIL import Image
+
+    doc = ezdxf.new("R2018")
+    doc.styles.get("Standard").dxf.font = ""  # 空字体名
+    doc.modelspace().add_text("一", dxfattribs={"height": 10}).set_placement((0, 0))
+    dxf = tmp_path / "empty_font.dxf"
+    png = tmp_path / "out.png"
+    doc.saveas(dxf)
+    render_dxf(dxf, png, RenderOptions(dpi=100))
+
+    arr = np.array(Image.open(png).convert("L"))
+    ys, xs = np.where(arr < 128)
+    assert len(xs) > 0, "应渲染出文字"
+    width = xs.max() - xs.min() + 1
+    height = ys.max() - ys.min() + 1
+    assert width > height * 3, f"空字体名未映射到中文字体：{width}x{height}"
+
+
 def test_bundled_font_contours_use_opposite_winding() -> None:
     """内置中文字体的封闭字形（如"口"）应外轮廓、内孔轮廓方向相反。
 
