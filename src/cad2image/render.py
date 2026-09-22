@@ -46,6 +46,10 @@ _TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 # 覆盖后文本统一回落到已 remap 到内置字体的样式字体，渲染正确。
 _INLINE_FONT_RE = re.compile(r"\\[fF][^;]*;")
 
+# 内置字体缺少字形的符号 → 视觉等价的有字形符号。思源宋体（SourceHanSerifSC）缺少
+# 直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，保证直径符号可见。
+_GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8)}
+
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
     """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
@@ -169,6 +173,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
+    _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
@@ -204,6 +209,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
+    _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
@@ -410,6 +416,27 @@ def _decode_multibyte_text(doc: ezdxf.document.Drawing) -> None:
             decoded = _decode_multibyte_escapes(raw)
             if decoded != raw:
                 entity.dxf.text = decoded
+
+
+def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
+    """把内置字体缺少字形的符号替换为视觉等价的有字形符号。
+
+    思源宋体缺少直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，
+    保证直径符号可见。映射表见模块级 ``_GLYPH_FALLBACKS``。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() not in _TEXT_ENTITIES:
+                continue
+            raw = entity.dxf.get("text", "")
+            if not raw:
+                continue
+            new = raw
+            for src, dst in _GLYPH_FALLBACKS.items():
+                if src in new:
+                    new = new.replace(src, dst)
+            if new != raw:
+                entity.dxf.text = new
 
 
 def _validate_ctb(ctb: str) -> str:

@@ -261,6 +261,18 @@ def test_remap_mtext_inline_fonts_strips_any_font() -> None:
     assert list(doc.modelspace())[0].dxf.text == r"{ABC}"
 
 
+def test_remap_missing_glyphs_diameter() -> None:
+    """直径符号 U+2300 应替换为 U+00D8（内置宋体缺前者、有后者）。"""
+    import ezdxf
+
+    from cad2image.render import _remap_missing_glyphs
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_text(chr(0x2300) + "10", dxfattribs={"height": 10})
+    _remap_missing_glyphs(doc)
+    assert list(doc.modelspace())[0].dxf.text == chr(0x00D8) + "10"
+
+
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
     """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
     import ezdxf
