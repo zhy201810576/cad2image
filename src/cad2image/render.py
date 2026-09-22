@@ -277,7 +277,7 @@ def _bundled_font_dir() -> Path:
 
 # 专有字体 → 随包内置的开源字体（SIL OFL 1.1）。ezdxf 按文件名查找字体，
 # 因此只需把文字样式的 font 名重写为内置字体的文件名即可命中。
-_OPEN_CJK_FONT = "NotoSansSC-Regular.ttf"  # 中文（含拉丁字符，TrueType 轮廓）
+_OPEN_CJK_FONT = "SourceHanSerifSC-Regular.ttf"  # 中文（含拉丁字符，TrueType 轮廓）
 _OPEN_MONO_FONT = "NotoSansMono-Regular.ttf"  # ASCII 等宽，近似 CAD 单线字体
 
 # 中文字体名（微软 SimSun 系 + 常见中文 bigfont SHX），大小写不敏感。

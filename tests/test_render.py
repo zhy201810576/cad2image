@@ -199,7 +199,7 @@ def test_render_chinese_text_uses_cjk_font(tmp_path: Path) -> None:
     """中文字形应渲染为真实笔画（细横条），而非 ``.notdef`` 方框。
 
     回归：字体必须扫描在 bbox 测量之前；且引用 ``NSimSun.ttf`` 的中文样式会被
-    自动重写为内置开源字体 ``NotoSansSC-Regular.ttf``，避免中文变成方框。
+    自动重写为内置开源字体 ``SourceHanSerifSC-Regular.ttf``，避免中文变成方框。
     """
     import ezdxf
     import numpy as np
@@ -226,10 +226,10 @@ def test_map_font_name_empty_and_chinese_names() -> None:
     """空字体名与含中文的字体名应映射到内置中文字体，而非等宽或原样。"""
     from cad2image.render import _map_font_name
 
-    assert _map_font_name("") == "NotoSansSC-Regular.ttf"
-    assert _map_font_name("   ") == "NotoSansSC-Regular.ttf"
-    assert _map_font_name("仿宋_GB2312") == "NotoSansSC-Regular.ttf"
-    assert _map_font_name("黑体") == "NotoSansSC-Regular.ttf"
+    assert _map_font_name("") == "SourceHanSerifSC-Regular.ttf"
+    assert _map_font_name("   ") == "SourceHanSerifSC-Regular.ttf"
+    assert _map_font_name("仿宋_GB2312") == "SourceHanSerifSC-Regular.ttf"
+    assert _map_font_name("黑体") == "SourceHanSerifSC-Regular.ttf"
     # 非中文字体名不受影响
     assert _map_font_name("romans.shx") == "NotoSansMono-Regular.ttf"
     assert _map_font_name("Arial.ttf") == "Arial.ttf"
@@ -267,7 +267,7 @@ def test_bundled_font_contours_use_opposite_winding() -> None:
     from fontTools.pens.recordingPen import RecordingPen
     from fontTools.ttLib import TTFont
 
-    font_path = _bundled_font_dir() / "NotoSansSC-Regular.ttf"
+    font_path = _bundled_font_dir() / "SourceHanSerifSC-Regular.ttf"
     font = TTFont(font_path)
     glyph_name = font.getBestCmap()[ord("口")]  # "口"
     pen = RecordingPen()

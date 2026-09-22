@@ -118,12 +118,12 @@ cad2image 图.dwg -o 图.png --width 420 --height 297
 
 | 字体文件 | 用途 |
 |---|---|
-| `NotoSansSC-Regular.ttf` | 中文（含拉丁字符） |
+| `SourceHanSerifSC-Regular.ttf` | 中文（含拉丁字符） |
 | `NotoSansMono-Regular.ttf` | ASCII 等宽，近似 CAD 单线字体 |
 
 CAD 图纸常引用专有字体（微软 `SimSun`/`NSimSun`、Autodesk `romans.shx`/`txt.shx` 等），渲染时会**自动重写为内置开源字体**：
 
-- `SimSun` / `NSimSun` / `宋体` / 中文 bigfont → `NotoSansSC-Regular.ttf`
+- `SimSun` / `NSimSun` / `宋体` / 中文 bigfont → `SourceHanSerifSC-Regular.ttf`
 - 其余 SHX 字形字体 → `NotoSansMono-Regular.ttf`
 
 > 替换会改变文字外观，但保证纯开源、无再分发风险。若需严格保留原字体观感，可自行将对应字体放入 `fonts/`，或用 `--font-dir` 指定附加字体目录。
