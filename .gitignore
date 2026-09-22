@@ -30,3 +30,6 @@ ODAFileConverter_v21.5.0/
 
 # 本地部署脚本（不入库）
 安装ODA依赖.sh
+
+# 字体源文件（已随包内置到 src/cad2image/fonts/，根目录这份不入库）
+/SourceHanSerifSC-Regular.ttf
