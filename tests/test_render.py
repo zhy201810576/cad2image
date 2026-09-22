@@ -273,6 +273,40 @@ def test_remap_missing_glyphs_diameter() -> None:
     assert list(doc.modelspace())[0].dxf.text == chr(0x00D8) + "10"
 
 
+def test_expand_autocad_control_codes() -> None:
+    """AutoCAD 控制码 %%c/%%d/%%p 应展开为 Ø/°/±，%%% 展开为字面 %。
+
+    回归：CAD 直径/度/正负符号常以 %%c/%%d/%%p 控制码存于文字，ezdxf 不解析控制码，
+    会原样渲染成 "%c" 或（ODA 展开成 U+2300 时）字体缺字形 → 方框。
+    """
+    import ezdxf
+
+    from cad2image.render import _expand_autocad_control_codes
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_mtext(r"{\Fdim|c0;%%C}2.6%%P0.1")
+    msp.add_text(r"%%dC 100%%%", dxfattribs={"height": 10})
+
+    _expand_autocad_control_codes(doc)
+
+    entities = list(msp)
+    assert entities[0].dxf.text == r"{\Fdim|c0;Ø}2.6±0.1"
+    assert entities[1].dxf.text == r"°C 100%"
+
+
+def test_expand_autocad_control_codes_keeps_plain_text() -> None:
+    """无控制码的普通文本应原样保留（含单个 % 不误伤）。"""
+    import ezdxf
+
+    from cad2image.render import _expand_autocad_control_codes
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_text("50% A3", dxfattribs={"height": 10})
+    _expand_autocad_control_codes(doc)
+    assert list(doc.modelspace())[0].dxf.text == "50% A3"
+
+
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
     """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
     import ezdxf

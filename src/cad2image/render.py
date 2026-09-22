@@ -50,6 +50,11 @@ _INLINE_FONT_RE = re.compile(r"\\[fF][^;]*;")
 # 直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，保证直径符号可见。
 _GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8)}
 
+# AutoCAD 控制码 %%c/%%d/%%p 及字面百分号 %%%。ezdxf 不解析这些控制码，会原样渲染成
+# "%c" 之类；这里展开为内置字体实际包含的字形（%%c → Ø 而非 U+2300，因宋体缺后者）。
+_AUTOCAD_CONTROL_RE = re.compile(r"%%[cCdDpP%]")
+_AUTOCAD_CONTROL_MAP = {"c": chr(0x00D8), "d": chr(0x00B0), "p": chr(0x00B1)}
+
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
     """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
@@ -173,6 +178,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
+    _expand_autocad_control_codes(doc)
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
@@ -209,6 +215,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _configure_fonts(options.font_dir)
     doc = _read_document(dxf_path)
     _decode_multibyte_text(doc)
+    _expand_autocad_control_codes(doc)
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
@@ -435,6 +442,32 @@ def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
             for src, dst in _GLYPH_FALLBACKS.items():
                 if src in new:
                     new = new.replace(src, dst)
+            if new != raw:
+                entity.dxf.text = new
+
+
+def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
+    """展开 AutoCAD 控制码 ``%%c`` / ``%%d`` / ``%%p``（及字面 ``%%%``）为 Unicode 符号。
+
+    CAD 图纸常把直径/度/正负符号写作 ``%%c`` / ``%%d`` / ``%%p``，而非真实 Unicode。
+    ezdxf 不解析这些控制码、会原样渲染成 "%c" 之类；不同 ODA 版本有的展开成 ⌀
+    （U+2300，内置宋体缺字形 → 方框），有的保留字面。这里统一展开为内置字体实际
+    包含的字形：%%c → Ø（U+00D8）、%%d → °（U+00B0）、%%p → ±（U+00B1）。
+    """
+    def repl(match: re.Match[str]) -> str:
+        code = match.group(0)[2:]
+        if code == "%":
+            return "%"
+        return _AUTOCAD_CONTROL_MAP[code.lower()]
+
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() not in _TEXT_ENTITIES:
+                continue
+            raw = entity.dxf.get("text", "")
+            if not raw or "%%" not in raw:
+                continue
+            new = _AUTOCAD_CONTROL_RE.sub(repl, raw)
             if new != raw:
                 entity.dxf.text = new
 
