@@ -40,10 +40,11 @@ _M_PLUS_ESCAPE_RE = re.compile(r"\\[Mm]\+([0-9A-Fa-f]{4,5})")
 # 需要解码多字节转义的文字实体类型。
 _TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
-# 匹配 MTEXT 内联字体覆盖 \fXXX / \FXXX（XXX 为字体名，后跟可选的 |flags;）。
-# 部分图纸用内联 \fNSimSun 覆盖样式字体，ezdxf 找不到该专有字体时回退，导致
-# 其中的西文/直径符号等变方框，需一并重写为内置字体。
-_INLINE_FONT_RE = re.compile(r"(\\[fF])([^;|]*)")
+# 匹配 MTEXT 内联字体覆盖 \fXXX; / \FXXX;（XXX 为字体名，含可选的 |flags）。
+# 部分图纸用内联 \fNSimSun 覆盖样式字体，而 ezdxf 对内联字体的解析与样式字体不同
+# ——内联字体名无法命中扫描目录、回退到默认字体，导致西文/直径符号等方框。移除内联
+# 覆盖后文本统一回落到已 remap 到内置字体的样式字体，渲染正确。
+_INLINE_FONT_RE = re.compile(r"\\[fF][^;]*;")
 
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
@@ -350,22 +351,13 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
             style.dxf.font = mapped
 
 
-def _remap_inline_font(match: re.Match[str]) -> str:
-    """重写单个 MTEXT 内联字体覆盖：``\\fNSimSun`` → ``\\f内置字体``。"""
-    prefix = match.group(1)  # \f 或 \F
-    font_name = match.group(2)
-    mapped = _map_font_name(font_name)
-    if mapped == font_name:
-        return match.group(0)  # 未命中映射，原样保留
-    return f"{prefix}{mapped}"
-
-
 def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
-    """把 MTEXT 内联字体覆盖（``\\fXXX``）也重写为内置字体。
+    """移除 MTEXT 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），让文本回落到样式字体。
 
-    部分图纸的 MTEXT 用内联 ``\\fNSimSun`` 等覆盖样式字体，ezdxf 找不到该专有字体
-    时回退到无该字形的默认字体，导致其中的西文/直径符号等变方框。这里把内联字体名
-    一并映射到内置字体（与样式字体 remap 规则一致）。
+    ezdxf 对 MTEXT 内联字体的解析与样式字体不同：内联字体名（如 ``NSimSun`` 或
+    改写后的 TTF 文件名）无法命中扫描目录、回退到默认字体，导致其中的西文/直径
+    符号等变方框。移除内联覆盖后，文本统一使用样式字体（已在
+    :func:`_remap_text_style_fonts` 中映射到内置字体），渲染正确。
     """
     for layout in doc.layouts:
         for entity in layout:
@@ -374,7 +366,7 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
             raw = entity.dxf.get("text", "")
             if not raw or "\\f" not in raw.lower():
                 continue
-            new = _INLINE_FONT_RE.sub(_remap_inline_font, raw)
+            new = _INLINE_FONT_RE.sub("", raw)
             if new != raw:
                 entity.dxf.text = new
 

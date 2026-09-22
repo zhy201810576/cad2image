@@ -236,7 +236,7 @@ def test_map_font_name_empty_and_chinese_names() -> None:
 
 
 def test_remap_mtext_inline_fonts() -> None:
-    """MTEXT 内联 \\fNSimSun 覆盖应重写为内置字体，其余内容保留。"""
+    """MTEXT 内联 \\fXXX 覆盖应被移除，文本回落到样式字体，其余内容保留。"""
     import ezdxf
 
     from cad2image.render import _remap_mtext_inline_fonts
@@ -246,13 +246,11 @@ def test_remap_mtext_inline_fonts() -> None:
     _remap_mtext_inline_fonts(doc)
 
     text = list(doc.modelspace())[0].dxf.text
-    assert "NSimSun" not in text
-    assert "SourceHanSerifSC-Regular.ttf" in text
-    assert r"\W1;Y" in text  # 非字体部分原样保留
+    assert text == r"{\W1;Y}"  # \f 覆盖被移除，宽度因子与文字保留
 
 
-def test_remap_mtext_inline_fonts_keeps_unmapped() -> None:
-    """内联字体名无需映射时（如 Arial）原样保留。"""
+def test_remap_mtext_inline_fonts_strips_any_font() -> None:
+    """内联字体名无论是否专有（Arial 也一样）都应被移除，统一回落样式字体。"""
     import ezdxf
 
     from cad2image.render import _remap_mtext_inline_fonts
@@ -260,7 +258,7 @@ def test_remap_mtext_inline_fonts_keeps_unmapped() -> None:
     doc = ezdxf.new("R2018")
     doc.modelspace().add_mtext(r"{\fArial.ttf;ABC}")
     _remap_mtext_inline_fonts(doc)
-    assert r"{\fArial.ttf;ABC}" in list(doc.modelspace())[0].dxf.text
+    assert list(doc.modelspace())[0].dxf.text == r"{ABC}"
 
 
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
