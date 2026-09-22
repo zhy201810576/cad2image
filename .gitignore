@@ -27,3 +27,6 @@ _odatest/
 # 第三方专有安装包（ODA File Converter）
 ODAFileConverter_v21.5.0/
 *.msi
+
+# 本地部署脚本（不入库）
+安装ODA依赖.sh
