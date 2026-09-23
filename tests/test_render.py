@@ -261,6 +261,29 @@ def test_remap_mtext_inline_fonts_strips_any_font() -> None:
     assert list(doc.modelspace())[0].dxf.text == r"{ABC}"
 
 
+def test_remap_mtext_inline_fonts_in_block() -> None:
+    """块定义内的 MTEXT 内联 \\f 覆盖也应被移除。
+
+    回归：标题栏/图框/工艺单等文字通常放在块定义里，INSERT 引用后 ezdxf 会递归渲染
+    块内文字。这些实体不在 ``doc.layouts`` 中，若只遍历布局会漏掉，内联字体名
+    （如 ``\\f仿宋_GB2312``）无法命中扫描目录 → 回退默认字体 → 中文变方框。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_mtext_inline_fonts
+
+    doc = ezdxf.new("R2018")
+    blk = doc.blocks.new("图框")
+    blk.add_mtext(r"\f仿宋_GB2312|b0|i0|p34;借（通）用")
+    blk.add_mtext(r"{\fNSimSun|b0|i0|c134|p49;\W1;Y}")
+    doc.modelspace().add_blockref("图框", (0, 0))
+
+    _remap_mtext_inline_fonts(doc)
+
+    texts = [e.dxf.text for e in blk if e.dxftype() == "MTEXT"]
+    assert texts == ["借（通）用", r"{\W1;Y}"], texts
+
+
 def test_remap_missing_glyphs_diameter() -> None:
     """直径符号 U+2300 应替换为 U+00D8（内置宋体缺前者、有后者）。"""
     import ezdxf

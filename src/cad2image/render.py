@@ -21,7 +21,7 @@ from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
 from ezdxf.addons.drawing.svg import SVGBackend
-from ezdxf.entities import Dimension
+from ezdxf.entities import Dimension, DXFGraphic
 from ezdxf.fonts import fonts as ezdxf_fonts
 from ezdxf.layouts import Layout
 from ezdxf.math import Vec2
@@ -369,6 +369,20 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
             style.dxf.font = mapped
 
 
+def _iter_text_entities(doc: ezdxf.document.Drawing) -> Iterator[DXFGraphic]:
+    """遍历文档内所有文字实体，覆盖模型/图纸空间与块定义（含匿名块）。
+
+    ezdxf 渲染 INSERT 引用的块时会递归渲染块定义内的文字实体，而这些实体只存在于
+    ``doc.blocks``（不在 ``doc.layouts``）。若只遍历 ``doc.layouts`` 会漏掉块内文字
+    （标题栏、图框、工艺单等里的中文），导致内联字体 / 控制码 / 多字节转义未被处理，
+    中文或符号变方框。
+    """
+    for block in doc.blocks:
+        for entity in block:
+            if entity.dxftype() in _TEXT_ENTITIES:
+                yield entity
+
+
 def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
     """移除 MTEXT 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），回落到样式字体。
 
@@ -377,16 +391,15 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
     符号等变方框。移除内联覆盖后，文本统一使用样式字体（已在
     :func:`_remap_text_style_fonts` 中映射到内置字体），渲染正确。
     """
-    for layout in doc.layouts:
-        for entity in layout:
-            if entity.dxftype() != "MTEXT":
-                continue
-            raw = entity.dxf.get("text", "")
-            if not raw or "\\f" not in raw.lower():
-                continue
-            new = _INLINE_FONT_RE.sub("", raw)
-            if new != raw:
-                entity.dxf.text = new
+    for entity in _iter_text_entities(doc):
+        if entity.dxftype() != "MTEXT":
+            continue
+        raw = entity.dxf.get("text", "")
+        if not raw or "\\f" not in raw.lower():
+            continue
+        new = _INLINE_FONT_RE.sub("", raw)
+        if new != raw:
+            entity.dxf.text = new
 
 
 def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
@@ -451,16 +464,13 @@ def _decode_multibyte_escapes(text: str) -> str:
 
 def _decode_multibyte_text(doc: ezdxf.document.Drawing) -> None:
     """解码文档内所有文字实体的多字节转义（见 :func:`_decode_multibyte_escapes`）。"""
-    for layout in doc.layouts:
-        for entity in layout:
-            if entity.dxftype() not in _TEXT_ENTITIES:
-                continue
-            raw = entity.dxf.get("text", "")
-            if not raw:
-                continue
-            decoded = _decode_multibyte_escapes(raw)
-            if decoded != raw:
-                entity.dxf.text = decoded
+    for entity in _iter_text_entities(doc):
+        raw = entity.dxf.get("text", "")
+        if not raw:
+            continue
+        decoded = _decode_multibyte_escapes(raw)
+        if decoded != raw:
+            entity.dxf.text = decoded
 
 
 def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
@@ -469,19 +479,16 @@ def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
     思源宋体缺少直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，
     保证直径符号可见。映射表见模块级 ``_GLYPH_FALLBACKS``。
     """
-    for layout in doc.layouts:
-        for entity in layout:
-            if entity.dxftype() not in _TEXT_ENTITIES:
-                continue
-            raw = entity.dxf.get("text", "")
-            if not raw:
-                continue
-            new = raw
-            for src, dst in _GLYPH_FALLBACKS.items():
-                if src in new:
-                    new = new.replace(src, dst)
-            if new != raw:
-                entity.dxf.text = new
+    for entity in _iter_text_entities(doc):
+        raw = entity.dxf.get("text", "")
+        if not raw:
+            continue
+        new = raw
+        for src, dst in _GLYPH_FALLBACKS.items():
+            if src in new:
+                new = new.replace(src, dst)
+        if new != raw:
+            entity.dxf.text = new
 
 
 def _expand_autocad_control_codes_in_text(text: str) -> str:
@@ -503,16 +510,13 @@ def _expand_autocad_control_codes_in_text(text: str) -> str:
 
 def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
     """展开文档内所有文字实体的 AutoCAD 控制码（见 :func:`_expand_autocad_control_codes_in_text`）。"""
-    for layout in doc.layouts:
-        for entity in layout:
-            if entity.dxftype() not in _TEXT_ENTITIES:
-                continue
-            raw = entity.dxf.get("text", "")
-            if not raw or "%%" not in raw:
-                continue
-            new = _expand_autocad_control_codes_in_text(raw)
-            if new != raw:
-                entity.dxf.text = new
+    for entity in _iter_text_entities(doc):
+        raw = entity.dxf.get("text", "")
+        if not raw or "%%" not in raw:
+            continue
+        new = _expand_autocad_control_codes_in_text(raw)
+        if new != raw:
+            entity.dxf.text = new
 
 
 def _validate_ctb(ctb: str) -> str:
