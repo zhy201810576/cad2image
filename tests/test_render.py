@@ -307,26 +307,32 @@ def test_expand_autocad_control_codes_keeps_plain_text() -> None:
     assert list(doc.modelspace())[0].dxf.text == "50% A3"
 
 
-def test_expand_autocad_control_codes_in_dimension() -> None:
-    """DIMENSION 的 text 覆盖（组码 1）里的 %%c/%%p 也应展开，直径尺寸标注最常在此。
+def test_remap_dimension_geometry_texts() -> None:
+    """DIMENSION 的渲染文本在几何块内，%%c/内联字体必须改块内文本而非 dxf.text。
 
-    回归：直径尺寸标注的 %%c 存于 DIMENSION 实体的 text 覆盖而非 TEXT/MTEXT，
-    此前 _TEXT_ENTITIES 不含 DIMENSION，导致直径符号不展开、渲染成方框。
+    回归：ezdxf 渲染 DIMENSION 读的是关联匿名几何块里的 MTEXT（含 %%c 与 \\f 内联
+    字体），而非 dxf.text 覆盖，故只改 dxf.text 对直径符号无效 → 方框。
     """
     import ezdxf
 
-    from cad2image.render import _expand_autocad_control_codes, _remap_mtext_inline_fonts
+    from cad2image.render import _remap_dimension_geometry_texts
 
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
     msp.add_linear_dim(base=(0, 0), p1=(0, 0), p2=(20, 0), angle=0)
     dim = list(msp.query("DIMENSION"))[0]
     dim.dxf.text = r"{\Fdim|c0;%%C}2.6%%P0.1"
+    dim.render()  # 生成匿名几何块（内含含 %%c 的 MTEXT）
+    block = dim.get_geometry_block()
+    assert block is not None
 
-    _expand_autocad_control_codes(doc)
-    _remap_mtext_inline_fonts(doc)
+    before = [e.dxf.get("text", "") for e in block if e.dxftype() == "MTEXT"]
+    assert any("%%C" in t for t in before), before
 
-    assert dim.dxf.text == r"{Ø}2.6±0.1"
+    _remap_dimension_geometry_texts(doc)
+
+    after = [e.dxf.get("text", "") for e in block if e.dxftype() == "MTEXT"]
+    assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:

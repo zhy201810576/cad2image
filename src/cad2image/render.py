@@ -21,6 +21,7 @@ from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
 from ezdxf.addons.drawing.svg import SVGBackend
+from ezdxf.entities import Dimension
 from ezdxf.fonts import fonts as ezdxf_fonts
 from ezdxf.layouts import Layout
 from ezdxf.math import Vec2
@@ -37,9 +38,10 @@ _XML_ENCODING_RE = re.compile(r"(encoding=)['\"][^'\"]*['\"]")
 # XXXX 是 GBK 双字节的十六进制）；ezdxf 不认识 M 转义，会原样渲染成乱码。
 _M_PLUS_ESCAPE_RE = re.compile(r"\\[Mm]\+([0-9A-Fa-f]{4,5})")
 
-# 需要解码多字节转义的文字实体类型。DIMENSION 的 text 覆盖（组码 1）同样可含控制码
-# 与内联字体，直径尺寸标注（%%c）最常见的位置就在这里，故一并纳入。
-_TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION"}
+# 需要解码多字节转义的文字实体类型。注意：DIMENSION 不在此列——它的渲染文本不在
+# text 覆盖（组码 1）里，而在关联的匿名几何块中，需由 _remap_dimension_geometry_texts
+# 单独处理（见下）。
+_TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
 # 匹配 MTEXT 内联字体覆盖 \fXXX; / \FXXX;（XXX 为字体名，含可选的 |flags）。
 # 部分图纸用内联 \fNSimSun 覆盖样式字体，而 ezdxf 对内联字体的解析与样式字体不同
@@ -183,6 +185,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
+    _remap_dimension_geometry_texts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -220,6 +223,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
+    _remap_dimension_geometry_texts(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -366,19 +370,16 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
 
 
 def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
-    """移除 MTEXT / DIMENSION 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），回落到样式字体。
+    """移除 MTEXT 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），回落到样式字体。
 
     ezdxf 对 MTEXT 内联字体的解析与样式字体不同：内联字体名（如 ``NSimSun`` 或
     改写后的 TTF 文件名）无法命中扫描目录、回退到默认字体，导致其中的西文/直径
     符号等变方框。移除内联覆盖后，文本统一使用样式字体（已在
     :func:`_remap_text_style_fonts` 中映射到内置字体），渲染正确。
-
-    DIMENSION 的 text 覆盖（组码 1）常带 ``\\Fdim;`` 这类内联字体（直径尺寸标注
-    尤为常见），同样需要移除，否则 ``%%C`` 展开后的 Ø 会因内联字体无法解析而方框。
     """
     for layout in doc.layouts:
         for entity in layout:
-            if entity.dxftype() not in ("MTEXT", "DIMENSION"):
+            if entity.dxftype() != "MTEXT":
                 continue
             raw = entity.dxf.get("text", "")
             if not raw or "\\f" not in raw.lower():
@@ -386,6 +387,39 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
             new = _INLINE_FONT_RE.sub("", raw)
             if new != raw:
                 entity.dxf.text = new
+
+
+def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
+    """重映射 DIMENSION 几何块内的文字实体。
+
+    ezdxf 渲染 DIMENSION 时读的是关联匿名几何块里的 MTEXT/TEXT（由 ODA 转换时写死，
+    含 ``%%c`` 控制码与 ``\\f`` 内联字体），**而不是** ``dxf.text``（组码 1 的覆盖），
+    因此只改 ``dxf.text`` 不生效——直径尺寸标注的 ``%%c`` 不展开 → 方框。
+
+    这里直接对几何块内的文字实体应用与普通文字相同的重映射链（解码 \\M+、展开
+    %%c/%%d/%%p、替换缺字形、剥离内联字体），保证直径/度/正负符号正确渲染。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if not isinstance(entity, Dimension):
+                continue
+            block = entity.get_geometry_block()
+            if block is None:
+                continue
+            for block_entity in block:
+                if block_entity.dxftype() not in _TEXT_ENTITIES:
+                    continue
+                raw = block_entity.dxf.get("text", "")
+                if not raw:
+                    continue
+                new = _decode_multibyte_escapes(raw)
+                new = _expand_autocad_control_codes_in_text(new)
+                for src, dst in _GLYPH_FALLBACKS.items():
+                    if src in new:
+                        new = new.replace(src, dst)
+                new = _INLINE_FONT_RE.sub("", new)
+                if new != raw:
+                    block_entity.dxf.text = new
 
 
 def _decode_multibyte_escapes(text: str) -> str:
@@ -450,20 +484,25 @@ def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
                 entity.dxf.text = new
 
 
-def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
-    """展开 AutoCAD 控制码 ``%%c`` / ``%%d`` / ``%%p``（及字面 ``%%%``）为 Unicode 符号。
+def _expand_autocad_control_codes_in_text(text: str) -> str:
+    """展开单段文本里的 AutoCAD 控制码 ``%%c`` / ``%%d`` / ``%%p`` / ``%%%``。
 
-    CAD 图纸常把直径/度/正负符号写作 ``%%c`` / ``%%d`` / ``%%p``，而非真实 Unicode。
-    ezdxf 不解析这些控制码、会原样渲染成 "%c" 之类；不同 ODA 版本有的展开成 ⌀
-    （U+2300，内置宋体缺字形 → 方框），有的保留字面。这里统一展开为内置字体实际
-    包含的字形：%%c → Ø（U+00D8）、%%d → °（U+00B0）、%%p → ±（U+00B1）。
+    ``%%c`` → Ø（U+00D8）、``%%d`` → °（U+00B0）、``%%p`` → ±（U+00B1）、``%%%`` → ``%``。
+    ezdxf 不解析这些控制码、会原样渲染成 "%c" 之类，故渲染前统一展开为内置字体实际
+    包含的字形（宋体缺 U+2300，用有字形的 U+00D8）。
     """
+
     def repl(match: re.Match[str]) -> str:
         code = match.group(0)[2:]
         if code == "%":
             return "%"
         return _AUTOCAD_CONTROL_MAP[code.lower()]
 
+    return _AUTOCAD_CONTROL_RE.sub(repl, text)
+
+
+def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
+    """展开文档内所有文字实体的 AutoCAD 控制码（见 :func:`_expand_autocad_control_codes_in_text`）。"""
     for layout in doc.layouts:
         for entity in layout:
             if entity.dxftype() not in _TEXT_ENTITIES:
@@ -471,7 +510,7 @@ def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
             raw = entity.dxf.get("text", "")
             if not raw or "%%" not in raw:
                 continue
-            new = _AUTOCAD_CONTROL_RE.sub(repl, raw)
+            new = _expand_autocad_control_codes_in_text(raw)
             if new != raw:
                 entity.dxf.text = new
 
