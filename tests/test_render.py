@@ -307,6 +307,28 @@ def test_expand_autocad_control_codes_keeps_plain_text() -> None:
     assert list(doc.modelspace())[0].dxf.text == "50% A3"
 
 
+def test_expand_autocad_control_codes_in_dimension() -> None:
+    """DIMENSION 的 text 覆盖（组码 1）里的 %%c/%%p 也应展开，直径尺寸标注最常在此。
+
+    回归：直径尺寸标注的 %%c 存于 DIMENSION 实体的 text 覆盖而非 TEXT/MTEXT，
+    此前 _TEXT_ENTITIES 不含 DIMENSION，导致直径符号不展开、渲染成方框。
+    """
+    import ezdxf
+
+    from cad2image.render import _expand_autocad_control_codes, _remap_mtext_inline_fonts
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_linear_dim(base=(0, 0), p1=(0, 0), p2=(20, 0), angle=0)
+    dim = list(msp.query("DIMENSION"))[0]
+    dim.dxf.text = r"{\Fdim|c0;%%C}2.6%%P0.1"
+
+    _expand_autocad_control_codes(doc)
+    _remap_mtext_inline_fonts(doc)
+
+    assert dim.dxf.text == r"{Ø}2.6±0.1"
+
+
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
     """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
     import ezdxf

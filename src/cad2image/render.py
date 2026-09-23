@@ -37,8 +37,9 @@ _XML_ENCODING_RE = re.compile(r"(encoding=)['\"][^'\"]*['\"]")
 # XXXX 是 GBK 双字节的十六进制）；ezdxf 不认识 M 转义，会原样渲染成乱码。
 _M_PLUS_ESCAPE_RE = re.compile(r"\\[Mm]\+([0-9A-Fa-f]{4,5})")
 
-# 需要解码多字节转义的文字实体类型。
-_TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
+# 需要解码多字节转义的文字实体类型。DIMENSION 的 text 覆盖（组码 1）同样可含控制码
+# 与内联字体，直径尺寸标注（%%c）最常见的位置就在这里，故一并纳入。
+_TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION"}
 
 # 匹配 MTEXT 内联字体覆盖 \fXXX; / \FXXX;（XXX 为字体名，含可选的 |flags）。
 # 部分图纸用内联 \fNSimSun 覆盖样式字体，而 ezdxf 对内联字体的解析与样式字体不同
@@ -365,16 +366,19 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
 
 
 def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
-    """移除 MTEXT 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），让文本回落到样式字体。
+    """移除 MTEXT / DIMENSION 内联字体覆盖（``\\fXXX;`` / ``\\FXXX;``），回落到样式字体。
 
     ezdxf 对 MTEXT 内联字体的解析与样式字体不同：内联字体名（如 ``NSimSun`` 或
     改写后的 TTF 文件名）无法命中扫描目录、回退到默认字体，导致其中的西文/直径
     符号等变方框。移除内联覆盖后，文本统一使用样式字体（已在
     :func:`_remap_text_style_fonts` 中映射到内置字体），渲染正确。
+
+    DIMENSION 的 text 覆盖（组码 1）常带 ``\\Fdim;`` 这类内联字体（直径尺寸标注
+    尤为常见），同样需要移除，否则 ``%%C`` 展开后的 Ø 会因内联字体无法解析而方框。
     """
     for layout in doc.layouts:
         for entity in layout:
-            if entity.dxftype() != "MTEXT":
+            if entity.dxftype() not in ("MTEXT", "DIMENSION"):
                 continue
             raw = entity.dxf.get("text", "")
             if not raw or "\\f" not in raw.lower():
