@@ -358,6 +358,27 @@ def test_remap_dimension_geometry_texts() -> None:
     assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
+def test_clear_mleader_proxy_graphics() -> None:
+    """MULTILEADER 的代理图形应被清除，避免 ODA 硬编码的 .ttc 字体导致中文方框。
+
+    回归：ODA 转出的 MULTILEADER 代理图形把字体硬编码为 Windows 的 ``simsun.ttc``，
+    ezdxf 渲染 MULTILEADER 时无论全局代理图形策略如何都优先用代理图形，解析出的样式名
+    ``.ttc`` 无法命中字体管理器 → 回退默认字体 → 中文变方框。清除后走原生 RenderEngine，
+    文本回落已 remap 的样式字体。
+    """
+    import ezdxf
+
+    from cad2image.render import _clear_mleader_proxy_graphics
+
+    doc = ezdxf.new("R2018")
+    mleader = doc.modelspace().add_multileader_mtext().multileader
+    mleader.proxy_graphic = b"\x00\x01\x02"
+
+    _clear_mleader_proxy_graphics(doc)
+
+    assert mleader.proxy_graphic is None
+
+
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
     """文字样式 font 为空时也应渲染中文，而非方框（回归部分 ODA 版本转出空字体名）。"""
     import ezdxf

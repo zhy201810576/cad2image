@@ -186,6 +186,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
+    _clear_mleader_proxy_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -224,6 +225,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_text_style_fonts(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
+    _clear_mleader_proxy_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -433,6 +435,28 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
                 new = _INLINE_FONT_RE.sub("", new)
                 if new != raw:
                     block_entity.dxf.text = new
+
+
+def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
+    """清除 MULTILEADER 实体的代理图形（proxy graphic），强制走原生渲染。
+
+    ODA File Converter 转出的 MULTILEADER 代理图形把字体硬编码为 Windows 字体名
+    （如 ``simsun.ttc``，一个 TTC 集合）。ezdxf 渲染 MULTILEADER 时，其
+    ``__virtual_entities__`` 无论全局代理图形策略如何，都会**优先**用代理图形
+    （``virtual_entities(proxy_graphic=True)``），而代理图形里解析出的 TEXT 样式名是
+    ``simsun.ttc``——该 .ttc 不被字体管理器索引、无法命中 → 回退默认字体 → 中文变方框。
+
+    清除代理图形后，``virtual_entities`` 回落到原生 RenderEngine，文本改用真实的
+    文字样式（已在 :func:`_remap_text_style_fonts` 中映射到内置中文字体），中文正常。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() == "MULTILEADER":
+                entity.proxy_graphic = None
+    for block in doc.blocks:
+        for entity in block:
+            if entity.dxftype() == "MULTILEADER":
+                entity.proxy_graphic = None
 
 
 def _decode_multibyte_escapes(text: str) -> str:
