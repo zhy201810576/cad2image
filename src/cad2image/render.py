@@ -184,6 +184,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _expand_autocad_control_codes(doc)
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
+    _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
     _clear_mleader_proxy_graphics(doc)
@@ -223,6 +224,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _expand_autocad_control_codes(doc)
     _remap_missing_glyphs(doc)
     _remap_text_style_fonts(doc)
+    _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
     _clear_mleader_proxy_graphics(doc)
@@ -308,40 +310,49 @@ def _bundled_font_dir() -> Path:
 _OPEN_CJK_FONT = "SourceHanSerifSC-Regular.ttf"  # 中文（含拉丁字符，TrueType 轮廓）
 _OPEN_MONO_FONT = "NotoSansMono-Regular.ttf"  # ASCII 等宽，近似 CAD 单线字体
 
-# 中文字体名（微软 SimSun 系 + 常见中文 bigfont SHX），大小写不敏感。
-_CJK_FONT_NAMES = {
-    "simsun",
-    "simsun.ttf",
-    "nsimsun",
-    "nsimsun.ttf",
-    "宋体",
-    "新宋体",
-    # 常见中文 bigfont SHX（ezdxf 本身不支持 bigfont，重写后中文可正常渲染）
-    "hztxt",
-    "hztxt.shx",
-    "gbcbig",
-    "gbcbig.shx",
-    "hzdx",
-    "hzdx.shx",
-    "bigfont",
-    "bigfont.shx",
+# 西文单线字体名（Autodesk 标准 SHX，近似 CAD 单线字体），规范化（小写、去 .shx/.ttf
+# 后缀）后比较。命中 → 内置等宽字体；其余字体名（含所有中文字体名、中文 bigfont SHX、
+# 未知名字）一律映射到内置中文字体。
+#
+# 这里刻意**不再维护"中文字体名白名单"**：用户会用到什么中文字体名（SimHei / FangSong /
+# KaiTi / 宋体 / 仿宋 / 微软雅黑…）无法穷举，且不少是纯英文（SimHei、FangSong_GB2312
+# 等）、名字里不含汉字、也不以 .shx 结尾，旧的白名单 + 汉字启发式会漏判 → 误入等宽
+# 字体（无中文字形）→ 中文方框。改为"默认落思源宋体"：思源宋体含 CJK 与拉丁字形，
+# 无论哪种字体名落到它都不会方框，代价仅是西文字体观感统一（单线变衬线），可接受。
+_LATIN_MONO_FONT_STEMS = {
+    "romans", "romanc", "romand", "romant",
+    "txt", "monotxt",
+    "simplex", "complex",
+    "isocp", "isocp2", "isocp3", "isocpeur",
+    "italic", "italicc", "italict",
+    "gothic", "gothice", "gothicg", "gothici",
+    "gdt",
+    "arial",  # Arial（含 Arial.shx）：西文无衬线，等宽观感更接近 CAD 单线
 }
 
 
-def _contains_cjk(text: str) -> bool:
-    """判断字符串是否含 CJK 汉字（用于识别中文字体名，如"仿宋_GB2312"/"黑体"）。"""
-    return any("一" <= ch <= "鿿" for ch in text)
+def _normalize_font_stem(font_name: str) -> str:
+    """规范化字体名：小写并去掉 .shx/.ttf 扩展名，得到用于白名单比较的 stem。"""
+    lower = font_name.lower()
+    for suffix in (".shx", ".ttf"):
+        if lower.endswith(suffix):
+            return lower[: -len(suffix)]
+    return lower
 
 
 def _map_font_name(font_name: str) -> str:
-    """把专有字体名映射到随包内置的开源字体文件名，未命中原样返回。
+    """把字体名确定性映射到随包内置的两个开源字体之一。
+
+    西文单线字体（Autodesk SHX）→ 内置等宽字体；其余（含所有中文字体名、中文
+    bigfont SHX、空字体名、未知字体名）→ 内置思源宋体。思源宋体含 CJK 与拉丁字形，
+    作为默认兜底，保证无论图纸引用哪种字体名，中文都不会渲染成方框。
 
     Args:
         font_name: 文字样式原始 font 名（如 ``"NSimSun.ttf"``、``"romans.shx"``）。
 
     Returns:
-        内置开源字体文件名；非专有字体名（如 ``"Arial.ttf"``）原样返回，交由字体
-        管理器回退到系统字体。
+        内置开源字体文件名（``SourceHanSerifSC-Regular.ttf`` 或
+        ``NotoSansMono-Regular.ttf``）。
     """
     name = font_name.strip()
     if not name:
@@ -349,14 +360,9 @@ def _map_font_name(font_name: str) -> str:
         # 字体同时含 CJK 与拉丁字形，作为兜底最安全（否则 ezdxf 回退到无中文字形
         # 的 arial，中文变方框）。
         return _OPEN_CJK_FONT
-    lower = name.lower()
-    if lower in _CJK_FONT_NAMES or _contains_cjk(name):
-        return _OPEN_CJK_FONT
-    # 其余 SHX 字形字体（Autodesk 专有：romans/txt/simplex/isocp 等）→ 开源等宽字体。
-    # 与 ezdxf 的 is_shx_font_name 判定一致：以 .shx 结尾，或名字不含点。
-    if lower.endswith(".shx") or "." not in lower:
+    if _normalize_font_stem(name) in _LATIN_MONO_FONT_STEMS:
         return _OPEN_MONO_FONT
-    return font_name
+    return _OPEN_CJK_FONT
 
 
 def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
@@ -369,6 +375,47 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
         mapped = _map_font_name(style.dxf.font)
         if mapped != style.dxf.font:
             style.dxf.font = mapped
+
+
+def _ensure_cjk_style(doc: ezdxf.document.Drawing) -> str:
+    """返回一个指向内置中文字体的样式名，不存在则创建。
+
+    用于把含中文但样式字体无法渲染中文的文字实体（如空样式名、或引用 ``arial.ttf``
+    等纯西文字体）重指到中文字体。优先复用已映射到内置中文字体的既有样式，避免每张
+    图都新建样式。
+    """
+    for style in doc.styles:
+        if style.dxf.get("font", "") == _OPEN_CJK_FONT:
+            return str(style.dxf.name)
+    name = "_cad2image_cjk"
+    doc.styles.add(name, font=_OPEN_CJK_FONT)
+    return name
+
+
+def _contains_cjk(text: str) -> bool:
+    """判断字符串是否含 CJK 汉字（用于识别需要中文字形渲染的文字）。"""
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
+def _remap_cjk_text_styles(doc: ezdxf.document.Drawing) -> None:
+    """把含中文但样式字体非中文字体的文字实体，重指到内置中文字体样式。
+
+    ODA 转出的部分文字实体样式名为空（尤其 DIMENSION 几何块内的 MTEXT），ezdxf 渲染
+    时把空样式回退到 ``Standard``（ODA 常写为 ``arial.ttf``，无中文字形）→ 中文方框。
+    只重写样式表无效——这些实体的样式名本身是空的、根本没指到中文字体样式。这里按
+    文字内容判中文，把这类实体统一指到 :func:`_ensure_cjk_style` 返回的样式。
+    """
+    cjk_style_name = _ensure_cjk_style(doc)
+    for entity in _iter_text_entities(doc):
+        raw = entity.dxf.get("text", "")
+        if not _contains_cjk(raw):
+            continue
+        style_name = entity.dxf.get("style", "") or "Standard"
+        style = doc.styles.get(style_name)
+        font = style.dxf.get("font", "") if style is not None else ""
+        if font == _OPEN_CJK_FONT:
+            continue  # 已经是中文字体
+        entity.dxf.style = cjk_style_name
 
 
 def _iter_text_entities(doc: ezdxf.document.Drawing) -> Iterator[DXFGraphic]:

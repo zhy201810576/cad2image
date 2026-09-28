@@ -222,17 +222,49 @@ def test_render_chinese_text_uses_cjk_font(tmp_path: Path) -> None:
     assert width > height * 3, f"中文字形异常：{width}x{height}，疑似 .notdef 方框"
 
 
-def test_map_font_name_empty_and_chinese_names() -> None:
-    """空字体名与含中文的字体名应映射到内置中文字体，而非等宽或原样。"""
+def test_map_font_name_defaults_to_cjk_font() -> None:
+    """字体名默认映射到思源宋体；仅明确的西文单线字体才映射到等宽。
+
+    回归：中文字体名无法穷举（SimHei/FangSong/KaiTi/微软雅黑…），且不少是纯英文、
+    不含汉字、不以 .shx 结尾，旧的中文白名单 + 汉字启发式会漏判 → 误入等宽字体 →
+    中文方框。改为"默认落思源宋体"，任何中文字体名都不会方框。
+    """
     from cad2image.render import _map_font_name
 
-    assert _map_font_name("") == "SourceHanSerifSC-Regular.ttf"
-    assert _map_font_name("   ") == "SourceHanSerifSC-Regular.ttf"
-    assert _map_font_name("仿宋_GB2312") == "SourceHanSerifSC-Regular.ttf"
-    assert _map_font_name("黑体") == "SourceHanSerifSC-Regular.ttf"
-    # 非中文字体名不受影响
-    assert _map_font_name("romans.shx") == "NotoSansMono-Regular.ttf"
-    assert _map_font_name("Arial.ttf") == "Arial.ttf"
+    cjk = "SourceHanSerifSC-Regular.ttf"
+    mono = "NotoSansMono-Regular.ttf"
+
+    # 空字体名 → 中文兜底
+    assert _map_font_name("") == cjk
+    assert _map_font_name("   ") == cjk
+
+    # 含汉字的字体名 → 中文
+    assert _map_font_name("仿宋_GB2312") == cjk
+    assert _map_font_name("黑体") == cjk
+
+    # 旧中文白名单里的名字 → 中文
+    assert _map_font_name("宋体") == cjk
+    assert _map_font_name("SimSun") == cjk
+    assert _map_font_name("NSimSun.ttf") == cjk
+
+    # 纯英文/拼音的中文字体名（旧逻辑会误判成等宽 → 方框）→ 中文
+    assert _map_font_name("SimHei") == cjk
+    assert _map_font_name("FangSong_GB2312") == cjk
+    assert _map_font_name("KaiTi") == cjk
+    assert _map_font_name("Microsoft YaHei") == cjk
+
+    # 中文 bigfont SHX → 中文（不再是等宽）
+    assert _map_font_name("hztxt.shx") == cjk
+    assert _map_font_name("gbcbig.shx") == cjk
+
+    # 西文单线 SHX → 等宽
+    assert _map_font_name("romans.shx") == mono
+    assert _map_font_name("txt") == mono
+    assert _map_font_name("simplex.shx") == mono
+    assert _map_font_name("isocp.shx") == mono
+
+    # Arial（西文无衬线）→ 等宽
+    assert _map_font_name("Arial.ttf") == mono
 
 
 def test_remap_mtext_inline_fonts() -> None:
@@ -377,6 +409,40 @@ def test_clear_mleader_proxy_graphics() -> None:
     _clear_mleader_proxy_graphics(doc)
 
     assert mleader.proxy_graphic is None
+
+
+def test_remap_cjk_text_styles() -> None:
+    """含中文但样式为空/西文字体的文字实体，应重指到内置中文字体样式。
+
+    回归：ODA 转出的部分 MTEXT（尤其 DIMENSION 几何块内）样式名为空，ezdxf 渲染时
+    回退到 ``Standard``（ODA 常写为 ``arial.ttf``，无中文字形）→ 中文方框。只重写
+    样式表无效——这些实体的样式名本身是空的。这里按文字内容判中文并重指样式。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_cjk_text_styles, _remap_text_style_fonts
+
+    doc = ezdxf.new("R2018")
+    doc.styles.get("Standard").dxf.font = "arial.ttf"
+    msp = doc.modelspace()
+    # 空样式 + 中文 → 应被重指
+    msp.add_mtext("拉直＜0.02")  # add_mtext 默认 style 为空
+    # 显式 Standard（arial.ttf）+ 中文 → 应被重指
+    msp.add_mtext("此腹板找平", dxfattribs={"style": "Standard"})
+    # 纯西文，不应被误改
+    msp.add_mtext("123.45")
+
+    _remap_text_style_fonts(doc)
+    _remap_cjk_text_styles(doc)
+
+    texts = list(msp)
+    # 前两个中文实体应被重指到中文字体样式（非空、且其字体为内置中文）
+    for entity in texts[:2]:
+        style_name = entity.dxf.get("style", "")
+        assert style_name != "", "中文实体样式名不应为空"
+        assert doc.styles.get(style_name).dxf.font == "SourceHanSerifSC-Regular.ttf"
+    # 纯西文实体样式应保持空（回退 Standard）
+    assert texts[2].dxf.get("style", "") == ""
 
 
 def test_render_empty_font_name_uses_cjk_font(tmp_path: Path) -> None:
