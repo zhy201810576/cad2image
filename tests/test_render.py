@@ -390,6 +390,39 @@ def test_remap_dimension_geometry_texts() -> None:
     assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
+def test_remap_dimension_colors() -> None:
+    """DIMENSION 几何块子实体的 ByBlock 颜色应改为标注实体自身的颜色。
+
+    回归：ODA 转出的 DIMENSION 几何块子实体颜色为 ByBlock(0)，ezdxf 渲染时把虚拟实体
+    的 ByBlock 解析成布局默认色（ACI 7），而非标注实体颜色/图层色，导致 CTB"使用对象
+    颜色"对标注不生效。这里应把子实体颜色改成标注实体颜色，使颜色解析回到正确链。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_dimension_colors
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_linear_dim(base=(0, 0), p1=(0, 0), p2=(20, 0), angle=0)
+    dim = list(msp.query("DIMENSION"))[0]
+    dim.render()
+    block = dim.get_geometry_block()
+    assert block is not None
+
+    # 模拟 ODA 输出：几何块子实体颜色为 ByBlock(0)，标注实体为显式绿色(3)
+    dim.dxf.color = 3
+    for e in block:
+        if e.dxftype() != "POINT":
+            e.dxf.color = 0
+
+    _remap_dimension_colors(doc)
+
+    for e in block:
+        if e.dxftype() == "POINT":
+            continue
+        assert e.dxf.color == 3, (e.dxftype(), e.dxf.color)
+
+
 def test_clear_mleader_proxy_graphics() -> None:
     """MULTILEADER 的代理图形应被清除，避免 ODA 硬编码的 .ttc 字体导致中文方框。
 

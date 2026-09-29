@@ -187,6 +187,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
+    _remap_dimension_colors(doc)
     _clear_mleader_proxy_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
@@ -227,6 +228,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
+    _remap_dimension_colors(doc)
     _clear_mleader_proxy_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
@@ -482,6 +484,31 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
                 new = _INLINE_FONT_RE.sub("", new)
                 if new != raw:
                     block_entity.dxf.text = new
+
+
+def _remap_dimension_colors(doc: ezdxf.document.Drawing) -> None:
+    """把 DIMENSION 几何块子实体的 ByBlock 颜色改成标注实体自身的颜色。
+
+    ODA 转出的 DIMENSION 几何块内子实体（尺寸线、箭头、文字）颜色为 ByBlock（0），
+    语义是"继承标注实体颜色"。但 ezdxf 渲染 DIMENSION 时把几何块子实体当**虚拟实体**
+    处理（没有块引用上下文），ByBlock 会被解析成布局默认色（ACI 7 白/黑），而不是
+    标注实体自己的颜色 / 图层颜色——导致 CTB 里"使用对象颜色"对标注不生效、标注颜色
+    固定成 ACI 7。
+
+    这里把几何块子实体的 ByBlock 颜色改为标注实体自身的颜色（ByLayer 256 或显式
+    ACI），使颜色解析回到正确链（ByLayer → 图层色 / 显式色），CTB 才能正确套用。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if not isinstance(entity, Dimension):
+                continue
+            block = entity.get_geometry_block()
+            if block is None:
+                continue
+            dim_color = entity.dxf.color  # 默认 BYLAYER(256)，或显式 ACI，或 BYBLOCK(0)
+            for block_entity in block:
+                if block_entity.dxf.get("color", None) == ezdxf.const.BYBLOCK:
+                    block_entity.dxf.color = dim_color
 
 
 def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
