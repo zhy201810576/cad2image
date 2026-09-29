@@ -423,6 +423,36 @@ def test_remap_dimension_colors() -> None:
         assert e.dxf.color == 3, (e.dxftype(), e.dxf.color)
 
 
+def test_remap_mleader_colors() -> None:
+    """MULTILEADER 引线/箭头/块内容的 ByBlock 颜色应改回引线实体自身颜色。
+
+    回归：ODA 转出的 MULTILEADER 引线颜色为 ByBlock(0)，ezdxf 渲染时把虚拟实体解析成
+    布局默认色（ACI 7），而非引线实体颜色/图层色，导致引线颜色不随 CTB"使用对象颜色"
+    变化。这里应把 ByBlock 改成引线实体的 dxf.color。
+    """
+    import ezdxf
+    from ezdxf.colors import BY_BLOCK_RAW_VALUE
+    from ezdxf.math import Vec2
+    from ezdxf.render.mleader import ConnectionSide, decode_raw_color
+
+    from cad2image.render import _remap_mleader_colors
+
+    doc = ezdxf.new("R2018")
+    builder = doc.modelspace().add_multileader_mtext()
+    builder.add_leader_line(ConnectionSide.right, [Vec2(0, 0), Vec2(5, 5)])
+    builder.set_content("测试")
+    builder.build(Vec2(10, 10))
+    mleader = builder.multileader
+    mleader.dxf.color = 3  # 显式绿色
+
+    line = mleader.context.leaders[0].lines[0]
+    assert line.color == BY_BLOCK_RAW_VALUE
+
+    _remap_mleader_colors(doc)
+
+    assert decode_raw_color(line.color)[0] == 3, decode_raw_color(line.color)
+
+
 def test_clear_mleader_proxy_graphics() -> None:
     """MULTILEADER 的代理图形应被清除，避免 ODA 硬编码的 .ttc 字体导致中文方框。
 

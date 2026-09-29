@@ -21,7 +21,7 @@ from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
 from ezdxf.addons.drawing.svg import SVGBackend
-from ezdxf.entities import Dimension, DXFGraphic
+from ezdxf.entities import Dimension, DXFGraphic, MultiLeader
 from ezdxf.fonts import fonts as ezdxf_fonts
 from ezdxf.layouts import Layout
 from ezdxf.math import Vec2
@@ -189,6 +189,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_colors(doc)
     _clear_mleader_proxy_graphics(doc)
+    _remap_mleader_colors(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -230,6 +231,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_colors(doc)
     _clear_mleader_proxy_graphics(doc)
+    _remap_mleader_colors(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -531,6 +533,28 @@ def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
         for entity in block:
             if entity.dxftype() == "MULTILEADER":
                 entity.proxy_graphic = None
+
+
+def _remap_mleader_colors(doc: ezdxf.document.Drawing) -> None:
+    """把 MULTILEADER 引线/箭头/块内容的 ByBlock 颜色改回引线实体自身颜色。
+
+    ODA 转出的 MULTILEADER 的 CONTEXT_DATA 里，引线（leader line）与箭头块的颜色为
+    ByBlock(0)，ezdxf 渲染时这些虚拟实体被解析成布局默认色（ACI 7），而非引线实体的
+    颜色 / 图层颜色 → 引线颜色不随 CTB"使用对象颜色"变化。这里把 ByBlock 改成引线实体
+    的 ``dxf.color``（默认 ByLayer 256 或显式 ACI）。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if not isinstance(entity, MultiLeader):
+                continue
+            target = ezdxf.colors.encode_raw_color(entity.dxf.color)  # 默认 BYLAYER(256)
+            for leader in entity.context.leaders:
+                for line in leader.lines:
+                    if line.color == ezdxf.colors.BY_BLOCK_RAW_VALUE:
+                        line.color = target
+            block = entity.context.block
+            if block is not None and block.color == ezdxf.colors.BY_BLOCK_RAW_VALUE:
+                block.color = target
 
 
 def _decode_multibyte_escapes(text: str) -> str:
