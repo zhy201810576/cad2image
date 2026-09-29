@@ -762,3 +762,176 @@ def test_remap_cjk_text_width_text_factor() -> None:
     texts = list(msp)
     assert abs(texts[0].dxf.width - 0.734) < 1e-6, texts[0].dxf.width
     assert texts[1].dxf.width == 1.0, texts[1].dxf.width
+
+
+def test_looks_like_image_formats() -> None:
+    """识别 BMP/PNG/JPEG/GIF 魔数，拒绝非图片与过短的 BMP。"""
+    from cad2image.render import _looks_like_image
+
+    assert _looks_like_image(b"BM" + b"\x00" * 30)
+    assert _looks_like_image(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+    assert _looks_like_image(b"\xff\xd8\xff\xe0" + b"\x00" * 10)
+    assert _looks_like_image(b"GIF89a" + b"\x00" * 10)
+    assert not _looks_like_image(b"NOT_AN_IMAGE" + b"\x00" * 20)
+    assert not _looks_like_image(b"BM" + b"\x00" * 5)
+
+
+def test_find_ole_image_stream_prefers_contents() -> None:
+    """优先命中常见流名 CONTENTS，返回图片字节。"""
+    from cad2image.render import _find_ole_image_stream
+
+    bmp = b"BM" + b"\x00" * 30
+
+    class _FakeStream:
+        def read(self) -> bytes:
+            return bmp
+
+    class _FakeOle:
+        def exists(self, name: str) -> bool:
+            return name == "CONTENTS"
+
+        def openstream(self, entry: object) -> _FakeStream:
+            return _FakeStream()
+
+        def listdir(self) -> list[object]:
+            return []
+
+    assert _find_ole_image_stream(_FakeOle()) == bmp
+
+
+def test_find_ole_image_stream_falls_back_to_all_streams() -> None:
+    """常见流名未命中时遍历全部流按魔数判断。"""
+    from cad2image.render import _find_ole_image_stream
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+
+    class _FakeStream:
+        def read(self) -> bytes:
+            return png
+
+    class _FakeOle:
+        def exists(self, name: str) -> bool:
+            return False
+
+        def openstream(self, entry: object) -> _FakeStream:
+            return _FakeStream()
+
+        def listdir(self) -> list[object]:
+            return [["ObjectPool"], ["CONTENTS"]]
+
+    assert _find_ole_image_stream(_FakeOle()) == png
+
+
+def test_find_ole_image_stream_no_image_returns_none() -> None:
+    """所有流都不是图片时返回 None。"""
+    from cad2image.render import _find_ole_image_stream
+
+    class _FakeStream:
+        def read(self) -> bytes:
+            return b"\x00" * 64
+
+    class _FakeOle:
+        def exists(self, name: str) -> bool:
+            return True
+
+        def openstream(self, entry: object) -> _FakeStream:
+            return _FakeStream()
+
+        def listdir(self) -> list[object]:
+            return []
+
+    assert _find_ole_image_stream(_FakeOle()) is None
+
+
+def test_extract_ole_images_empty_layout() -> None:
+    """无 OLE2FRAME 的布局返回空列表。"""
+    import ezdxf
+
+    from cad2image.render import _extract_ole_images
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_line((0, 0), (10, 10))
+
+    assert _extract_ole_images(msp) == []
+
+
+def test_extract_ole_images_ignores_invalid_ole_data() -> None:
+    """OLE2FRAME 二进制数据无 OLE 复合文档魔数时跳过，不崩溃。"""
+    import ezdxf
+    from ezdxf.entities import OLE2Frame
+    from ezdxf.lldxf.tags import Tags
+    from ezdxf.lldxf.types import DXFTag
+
+    from cad2image.render import _extract_ole_images
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    ole = OLE2Frame.new(dxfattribs={"layer": "0"}, doc=doc)
+    ole.acdb_ole2frame = Tags(
+        [
+            DXFTag(10, (0.0, 0.0, 0.0)),
+            DXFTag(11, (100.0, 100.0, 0.0)),
+            DXFTag(310, b"\x00\x01\x02"),  # 无 OLE 复合文档魔数
+        ]
+    )
+    msp.add_entity(ole)
+
+    assert _extract_ole_images(msp) == []
+
+
+def test_wrap_text_to_width_cjk() -> None:
+    """按宽度折行：中文逐字拆，超过 max_width 换行。"""
+    from cad2image.render import _wrap_text_to_width
+
+    def measure(t: str) -> float:
+        return float(len(t))
+    assert _wrap_text_to_width("工步一二三四", 3.0, measure) == ["工步一", "二三四"]
+
+
+def test_wrap_text_to_width_keeps_ascii_run() -> None:
+    """西文/数字连续段作为整体不拆分（"AB" 保持一个 token 不拆成 A、B）。"""
+    from cad2image.render import _wrap_text_to_width
+
+    def measure(t: str) -> float:
+        return float(len(t))
+    assert _wrap_text_to_width("AB余量", 3.0, measure) == ["AB余", "量"]
+
+
+def test_remap_cjk_text_width_wrap_wraps_long_text() -> None:
+    r"""含中文、框宽>0 且超宽的 MTEXT 应插入 \P 折行。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_mtext(
+        "工步一：以B面为基准磨C面，C面磨削余量0.03以内",
+        dxfattribs={"width": 40.0, "char_height": 2.5},
+    )
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert r"\P" in mtext.text, mtext.text
+
+
+def test_remap_cjk_text_width_wrap_skips_short_or_wide() -> None:
+    """短文本、无框宽（width<=0）、纯西文不折行。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_mtext("短文本", dxfattribs={"width": 100.0, "char_height": 2.5})
+    msp.add_mtext("无框宽的长中文文本", dxfattribs={"width": 0.0, "char_height": 2.5})
+    msp.add_mtext("ASCII only text", dxfattribs={"width": 5.0, "char_height": 2.5})
+
+    _remap_cjk_text_width_wrap(doc)
+
+    texts = [e.text for e in msp]
+    assert all(r"\P" not in t for t in texts), texts

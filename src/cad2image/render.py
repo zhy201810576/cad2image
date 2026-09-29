@@ -8,26 +8,28 @@ SVG 走 ezdxf SVG 后端。渲染流程：
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, NamedTuple
 
 import ezdxf
 import fitz  # type: ignore[import-untyped]
+import olefile  # type: ignore[import-untyped]
 from ezdxf import bbox
 from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
 from ezdxf.addons.drawing.svg import SVGBackend
 from ezdxf.addons.drawing.unified_text_renderer import UnifiedTextRenderer
-from ezdxf.entities import Dimension, DXFGraphic, MultiLeader
+from ezdxf.entities import Dimension, DXFGraphic, Leader, LWPolyline, MultiLeader, OLE2Frame
 from ezdxf.enums import TextEntityAlignment
 from ezdxf.fonts import fonts as ezdxf_fonts
 from ezdxf.layouts import BlockLayout, Layout
-from ezdxf.math import Vec2, Vec3
+from ezdxf.math import BoundingBox2d, Vec2, Vec3, intersection_line_line_2d
 
 from cad2image.config import RenderOptions, build_drawing_configuration
 
@@ -55,6 +57,27 @@ _INLINE_FONT_RE = re.compile(r"\\[fF][^;]*;")
 # 内置字体缺少字形的符号 → 视觉等价的有字形符号。思源宋体（SourceHanSerifSC）缺少
 # 直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，保证直径符号可见。
 _GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8)}
+
+# OLE 复合文档（Compound File Binary Format）魔数。DWG 里「粘贴的图片」绝大多数存成
+# OLE2FRAME 实体，其二进制数据（组码 310）在偏移 128 处起是这个魔数，之后是完整的 OLE
+# 复合文档，内嵌图片流（通常为 32 位 BMP）。
+_OLE_CF_MAGIC = b"\xd0\xcf\x11\xe0"
+
+# 常见图片格式魔数，用于在 OLE 复合文档的流里识别图片流（优先命中常见流名 CONTENTS，
+# 否则遍历全部流按魔数判断）。
+_OLE_IMAGE_STREAM_NAMES = ("CONTENTS", "Package", "Bitmap", "PBrush")
+
+
+class _EmbeddedImage(NamedTuple):
+    """从 OLE2FRAME 提取出的内嵌图片及其在 CAD 世界坐标中的轴对齐边界框。
+
+    ``image_bytes`` 是可直接交给 PyMuPDF ``Page.insert_image(stream=...)`` 的图片字节；
+    ``corner_min``/``corner_max`` 为 OLE2FRAME 包围盒的两个对角（世界坐标，z=0）。
+    """
+
+    image_bytes: bytes
+    corner_min: Vec2
+    corner_max: Vec2
 
 # AutoCAD 控制码 %%c/%%d/%%p 及字面百分号 %%%。ezdxf 不解析这些控制码，会原样渲染成
 # "%c" 之类；这里展开为内置字体实际包含的字形（%%c → Ø 而非 U+2300，因宋体缺后者）。
@@ -224,22 +247,31 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_cjk_text_width(doc)
+    _remap_cjk_text_width_wrap(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
+    _snap_leader_arrowheads(doc)
     _remap_tolerance_to_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
-    page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
+    embedded_images = _extract_ole_images(dxf_layout)
 
     context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
     backend = _SafePyMuPdfBackend()
     Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    # 用实际渲染内容（已排除 invisible/隐藏实体）确定页面，避免离群实体撑大页面、图形缩小。
+    page = _determine_page(dxf_layout, options, backend.player().bbox())
     settings = _build_render_settings(options)
     with _defer_content_wrap():
-        image_bytes = backend.get_pixmap_bytes(page, fmt="png", dpi=options.dpi, settings=settings)
+        if embedded_images:
+            image_bytes = _render_pixmap_with_images(
+                backend, page, settings, options.dpi, embedded_images
+            )
+        else:
+            image_bytes = backend.get_pixmap_bytes(page, fmt="png", dpi=options.dpi, settings=settings)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(image_bytes)
@@ -269,19 +301,22 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_cjk_text_width(doc)
+    _remap_cjk_text_width_wrap(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
+    _snap_leader_arrowheads(doc)
     _remap_tolerance_to_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
-    page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
 
     context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
     backend = SVGBackend()
     Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    # 用实际渲染内容（已排除 invisible/隐藏实体）确定页面，避免离群实体撑大页面、图形缩小。
+    page = _determine_page(dxf_layout, options, backend.player().bbox())
     settings = _build_render_settings(options)
     svg_string = _normalize_svg_encoding(backend.get_string(page, settings=settings))
 
@@ -530,6 +565,318 @@ def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
             continue
         if "\\W" not in raw:
             mtext_data.default_content = f"\\W{factor};" + raw
+
+
+# 匹配 MTEXT 文本开头的宽度因子前缀 ``\W<factor>;``（由 :func:`_remap_cjk_text_width` 添加）。
+_LEADING_WIDTH_FACTOR_RE = re.compile(r"^\\W[^;]*;")
+
+# MTEXT 内联格式码（字体/字高/堆叠/对齐/跟踪/颜色/倾斜/宽度等）。含这些码的文本按宽度
+# 折行会破坏格式结构，跳过不折行。
+_MTEXT_FORMAT_RE = re.compile(r"\\[fFhHsSaAtTcCqQwW]")
+
+# 折行 token 化：CJK 汉字/全角标点逐字拆，西文/数字/半角标点连续段作为不可拆整体。
+_CJK_WRAP_TOKEN_RE = re.compile(r"[⺀-鿿豈-﫿＀-￯]|[^⺀-鿿豈-﫿＀-￯]+")
+
+
+def _wrap_text_to_width(text: str, max_width: float, measure: Callable[[str], float]) -> list[str]:
+    """把文本按 ``max_width`` 折行：CJK 逐字拆、西文连续段整体，返回行列表。"""
+    tokens = _CJK_WRAP_TOKEN_RE.findall(text)
+    lines: list[str] = []
+    line = ""
+    for token in tokens:
+        candidate = line + token
+        if line and measure(candidate) > max_width:
+            lines.append(line)
+            line = token
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
+    """对含中文、框宽>0 且超宽的 MTEXT 按框宽折行，插入 ``\\P`` 强制换行。
+
+    ezdxf 的 MTEXT 自动换行只按空格/单词边界折行，不拆分无空格的中文长串；当 CAD 里中文
+    靠 MTEXT 框宽（width）自动折行时，ezdxf 会单行溢出（变一行）。这里在渲染前按框宽逐字
+    折行（CJK 逐字、西文连续段整体），插入 ``\\P`` 对齐 CAD 的折行效果。
+
+    只处理**纯文本**（无内联格式码、无已有换行）的 MTEXT；宽度按
+    :func:`_remap_cjk_text_width` 施加的 0.734 宽度因子折算（框宽除以 0.734 换回未压窄的
+    测量宽度）。
+    """
+    font_face = ezdxf_fonts.font_manager.get_font_face(_OPEN_CJK_FONT)
+    renderer = UnifiedTextRenderer()
+
+    for entity in _iter_text_entities(doc):
+        if entity.dxftype() != "MTEXT":
+            continue
+        raw = entity.dxf.get("text", "")
+        if not raw or not _contains_cjk(raw):
+            continue
+        width = entity.dxf.get("width", 0.0)
+        if width <= 0:
+            continue
+        char_height = entity.dxf.get("char_height", 2.5)
+
+        # 剥离开头的宽度因子前缀（\W0.734;），折行后再拼回。
+        prefix = ""
+        match = _LEADING_WIDTH_FACTOR_RE.match(raw)
+        if match is not None:
+            prefix = match.group(0)
+            raw = raw[match.end():]
+        # 含内联格式码或已有换行（\P）的跳过，避免折行破坏格式/手动换行。
+        if _MTEXT_FORMAT_RE.search(raw) or "\\P" in raw:
+            continue
+
+        # 压窄后框宽换算回未压窄的测量宽度（0.734 宽度因子）。
+        max_width = width / _CJK_WIDTH_FACTOR
+
+        def measure(text: str, _ch: float = char_height) -> float:
+            return renderer.get_text_line_width(text, font_face, _ch)
+
+        if measure(raw) <= max_width:
+            continue
+        lines = _wrap_text_to_width(raw, max_width, measure)
+        if len(lines) <= 1:
+            continue
+        entity.dxf.text = prefix + "\\P".join(lines)
+
+
+_LEADER_GRAPHICS_TYPES = {"LINE", "ARC", "CIRCLE", "LWPOLYLINE"}
+
+
+def _iter_leaders(doc: ezdxf.document.Drawing) -> Iterator[Leader]:
+    """遍历模型/图纸空间（layouts）里的 LEADER 实体。
+
+    只处理顶层布局里的 LEADER：块定义里的 LEADER 箭头指向的特征通常在块外（INSERT 后
+    才定位），在块内局部坐标下无法正确吸附，故不处理（避免误吸到 model space 的图形）。
+    """
+    for layout in doc.layouts:
+        for entity in layout:
+            if isinstance(entity, Leader):
+                yield entity
+
+
+def _leader_arrow_size(doc: ezdxf.document.Drawing, entity: DXFGraphic) -> float:
+    """读取 LEADER 箭头大小（dimasz × dimscale），默认 2.5。"""
+    dimstyle_name = entity.dxf.get("dimstyle", "")
+    dimstyle = doc.dimstyles.get(dimstyle_name) if dimstyle_name else None
+    dimasz = 2.5
+    dimscale = 1.0
+    if dimstyle is not None:
+        value = dimstyle.dxf.get("dimasz", None)
+        if value:
+            dimasz = float(value)
+        value = dimstyle.dxf.get("dimscale", None)
+        if value:
+            dimscale = float(value)
+    return dimasz * dimscale
+
+
+def _ray_intersect_graphic(
+    tip: Vec2, direction: Vec2, ray_len: float, entity: DXFGraphic
+) -> Vec2 | None:
+    """求从 tip 沿 direction 的射线（长度 ray_len）与图形实体的最近交点。
+
+    支持 LINE / CIRCLE / ARC / LWPOLYLINE；ARC 按整圆求交（不校验圆弧角度范围，
+    图形密集处可能误吸到圆弧延长部分，属可接受的近似）。
+    """
+    ray_end = tip + direction * ray_len
+    t = entity.dxftype()
+    best: Vec2 | None = None
+    best_d = float("inf")
+
+    if t == "LINE":
+        hit = intersection_line_line_2d(
+            (tip, ray_end), (Vec2(entity.dxf.start), Vec2(entity.dxf.end)), virtual=False
+        )
+        if hit is not None:
+            d = (hit - tip).magnitude
+            if d < best_d:
+                best_d, best = d, hit
+    elif t in ("CIRCLE", "ARC"):
+        center = Vec2(entity.dxf.center)
+        radius = float(entity.dxf.radius)
+        dvec = tip - center
+        a = direction.dot(direction)
+        b = 2.0 * dvec.dot(direction)
+        c = dvec.dot(dvec) - radius * radius
+        disc = b * b - 4.0 * a * c
+        if disc >= 0.0:
+            t_root = (-b - math.sqrt(disc)) / (2.0 * a)
+            if 0.0 <= t_root <= ray_len:
+                best_d, best = t_root, tip + direction * t_root
+    elif isinstance(entity, LWPolyline):
+        points = [Vec2(p) for p in entity.get_points("xy")]
+        for p0, p1 in zip(points, points[1:]):
+            hit = intersection_line_line_2d((tip, ray_end), (p0, p1), virtual=False)
+            if hit is not None:
+                d = (hit - tip).magnitude
+                if d < best_d:
+                    best_d, best = d, hit
+    return best
+
+
+def _snap_leader_arrowheads(doc: ezdxf.document.Drawing) -> None:
+    """把 LEADER 箭头尖端吸附到最近的图形轮廓，消除箭头悬空留下的空白。
+
+    ODA File Converter 转 DXF 时，LEADER 的特征端顶点（``vertices[0]``）常没精确落在
+    被标注的图形轮廓上，导致箭头尖端与图形之间留出几单位的空白（视觉上像线断了）。
+    这里对每条 LEADER：沿箭头指向方向发射射线探测最近的图形（LINE/ARC/CIRCLE/
+    LWPOLYLINE），若在约 3 倍箭头大小的范围内命中图形，就把 ``vertices[0]`` 沿方向挪到
+    使箭头尖端恰好落在图形上。只沿箭头方向探测，避免误吸到侧向的其它线。
+    """
+    graphics: list[DXFGraphic] = []
+    for layout in doc.layouts:
+        for entity in layout:
+            if entity.dxftype() in _LEADER_GRAPHICS_TYPES:
+                graphics.append(entity)
+
+    for entity in _iter_leaders(doc):
+        vertices = list(entity.vertices)
+        if len(vertices) < 2:
+            continue
+        v0 = Vec3(vertices[0])
+        v1 = Vec3(vertices[1])
+        direction = v0 - v1
+        length = direction.magnitude
+        if length < 1e-9:
+            continue
+        direction = direction / length
+        size = _leader_arrow_size(doc, entity)
+        tip = Vec2(v0.x, v0.y) + Vec2(direction.x, direction.y) * size
+        dir2 = Vec2(direction.x, direction.y)
+        ray_len = size * 3.0
+
+        best: Vec2 | None = None
+        best_d = float("inf")
+        for graphic in graphics:
+            hit = _ray_intersect_graphic(tip, dir2, ray_len, graphic)
+            if hit is not None:
+                d = (hit - tip).magnitude
+                if 0.0 < d < best_d:
+                    best_d, best = d, hit
+
+        if best is not None and best_d <= ray_len:
+            new_v0 = Vec3(best.x - dir2.x * size, best.y - dir2.y * size, v0.z)
+            entity.set_vertices([new_v0] + vertices[1:])
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """判断字节流是否为可渲染的图片格式（BMP / PNG / JPEG / GIF）。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    # BMP：'BM' 魔数 + 至少 BITMAPFILEHEADER(14) + BITMAPINFOHEADER(12) 的头。
+    return data.startswith(b"BM") and len(data) >= 26
+
+
+def _find_ole_image_stream(ole: olefile.OleFileIO) -> bytes | None:
+    """在 OLE 复合文档里找出内嵌图片流，优先命中常见流名，否则遍历全部流。"""
+    for name in _OLE_IMAGE_STREAM_NAMES:
+        if ole.exists(name):
+            data = bytes(ole.openstream(name).read())
+            if _looks_like_image(data):
+                return data
+    for entry in ole.listdir():
+        data = bytes(ole.openstream(entry).read())
+        if _looks_like_image(data):
+            return data
+    return None
+
+
+def _extract_ole_images(layout: Layout) -> list[_EmbeddedImage]:
+    """从布局里提取 OLE2FRAME 内嵌图片及其世界坐标包围盒。
+
+    ezdxf 的 drawing 前端不渲染 OLE2FRAME（只画灰矩形占位）。这里用 ``olefile`` 解析
+    其二进制数据（组码 310）里偏移 128 起的 OLE 复合文档、取出内嵌图片（通常 32 位
+    BMP），连同 OLE2FRAME 的包围盒一起返回，供渲染后在对应位置合成回去。
+    """
+    images: list[_EmbeddedImage] = []
+    for entity in layout:
+        if not isinstance(entity, OLE2Frame):
+            continue
+        data = entity.binary_data()
+        if not data:
+            continue
+        offset = data.find(_OLE_CF_MAGIC)
+        if offset < 0:
+            continue
+        try:
+            ole = olefile.OleFileIO(data[offset:])
+        except olefile.OleFileError:
+            continue
+        try:
+            image_bytes = _find_ole_image_stream(ole)
+        finally:
+            ole.close()
+        if image_bytes is None:
+            continue
+        bounds = entity.bbox()
+        if not bounds.has_data:
+            continue
+        corners = bounds.rect_vertices()
+        images.append(
+            _EmbeddedImage(
+                image_bytes=image_bytes,
+                corner_min=corners[0],
+                corner_max=corners[2],
+            )
+        )
+    return images
+
+
+def _render_pixmap_with_images(
+    backend: _SafePyMuPdfBackend,
+    page: layout_module.Page,
+    settings: layout_module.Settings,
+    dpi: int,
+    images: list[_EmbeddedImage],
+) -> bytes:
+    """渲染 PNG 并把内嵌图片合成到对应位置。
+
+    复现 ``PyMuPdfBackend.get_pixmap_bytes`` 的坐标布局流程（``_get_replay``）：计算内容
+    包围盒、确定最终页面、得到 CAD→页面坐标的变换矩阵，把记录回放到 fitz 页面之后、
+    光栅化之前，将内嵌图片按 OLE2FRAME 的世界坐标包围盒变换到页面坐标插入，使嵌入图片
+    与矢量内容一起渲染，不再只是灰矩形占位。
+    """
+    top_origin = True
+    player = backend.player()
+    render_box = player.bbox()
+    # OLE2FRAME 是 2D 实体（z=0），ezdxf 的 draw_ole2frame_entity 用 3D 的 is_empty 判断
+    # （z 方向尺寸为 0）误判为空、不画灰矩形，故 player.bbox() 不含 OLE 区域。这里把图片
+    # 包围盒并入 render_box，否则图片会落在页面之外被裁剪掉。
+    for image in images:
+        render_box.extend((image.corner_min, image.corner_max))
+    output_layout = layout_module.Layout(render_box, flip_y=True)
+    final_page = output_layout.get_final_page(page, settings)
+    settings = copy.copy(settings)
+    settings.output_coordinate_space = pymupdf.get_coordinate_output_space(final_page)
+    matrix = output_layout.get_placement_matrix(
+        final_page, settings=settings, top_origin=top_origin
+    )
+    player.transform(matrix)
+    render_backend = backend.make_backend(final_page, settings)
+    player.replay(render_backend)
+
+    for image in images:
+        p_min = matrix.transform(Vec3(image.corner_min.x, image.corner_min.y, 0.0))
+        p_max = matrix.transform(Vec3(image.corner_max.x, image.corner_max.y, 0.0))
+        rect = fitz.Rect(
+            min(p_min.x, p_max.x),
+            min(p_min.y, p_max.y),
+            max(p_min.x, p_max.x),
+            max(p_min.y, p_max.y),
+        )
+        render_backend.page.insert_image(rect, stream=image.image_bytes)
+
+    pixmap = render_backend.get_pixmap(dpi=dpi)
+    return bytes(pixmap.tobytes(output="png"))
 
 
 def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
@@ -954,10 +1301,18 @@ def _select_layout(doc: ezdxf.document.Drawing, layout_name: str | None) -> Layo
         raise ValueError(f"布局 '{layout_name}' 不存在，可用布局：{available}") from exc
 
 
-def _determine_page(dxf_layout: Layout, options: RenderOptions) -> layout_module.Page:
+def _determine_page(
+    dxf_layout: Layout,
+    options: RenderOptions,
+    content_bbox: BoundingBox2d | None = None,
+) -> layout_module.Page:
     """确定渲染页面尺寸。
 
     优先级：显式 ``width_mm/height_mm`` → 图纸空间页面设置 → 内容包围盒自适应。
+
+    ``content_bbox`` 为实际渲染内容的包围盒（渲染后由 ``player.bbox()`` 得到，已排除
+    invisible/隐藏实体），用于内容自适应时计算边距——``bbox.extents`` 会把隐藏的离群
+    实体也算进去，导致页面被撑大、图形缩小。
     """
     margins = layout_module.Margins.all(0)
     if options.width_mm is not None and options.height_mm is not None:
@@ -971,7 +1326,7 @@ def _determine_page(dxf_layout: Layout, options: RenderOptions) -> layout_module
     if page_from_layout is not None and not options.fit_to_extents:
         return page_from_layout
 
-    return _page_from_extents(dxf_layout, options.margin)
+    return _page_from_extents(dxf_layout, options.margin, content_bbox)
 
 
 def _page_from_paperspace(dxf_layout: Layout) -> layout_module.Page | None:
@@ -987,19 +1342,30 @@ def _page_from_paperspace(dxf_layout: Layout) -> layout_module.Page | None:
     return layout_module.Page.from_dxf_layout(dxf_layout_obj)  # type: ignore[arg-type]
 
 
-def _page_from_extents(dxf_layout: Layout, margin: float) -> layout_module.Page:
+def _page_from_extents(
+    dxf_layout: Layout,
+    margin: float,
+    content_bbox: BoundingBox2d | None = None,
+) -> layout_module.Page:
     """按布局内容包围盒确定页面，四周留百分比余量。
 
     ``margin`` 为内容较小边长的百分比（0–100）。页面尺寸置 0，交由 ``get_pixmap_bytes``
     按实际渲染内容（player 的 bbox）自动推导，余量通过 ``Margins`` 表达——这样四周余量
     均匀，且不受 ``bbox.extents`` 与真实渲染内容之间的偏差影响（``bbox.extents`` 会把
     某些实体（如文字）估算得过宽，导致显式页面宽度失真、上下贴边）。
+
+    ``content_bbox`` 为实际渲染内容的包围盒；提供时用它计算边距，避免 ``bbox.extents``
+    把 invisible/隐藏的离群实体（如 ODA 转出的辅助线）也算进范围、撑大页面。
     """
-    extents = bbox.extents(dxf_layout, fast=True)
-    if not extents.has_data:
-        raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
-    width = float(extents.size.x)
-    height = float(extents.size.y)
+    if content_bbox is not None and content_bbox.has_data:
+        width = float(content_bbox.size.x)
+        height = float(content_bbox.size.y)
+    else:
+        extents = bbox.extents(dxf_layout, fast=True)
+        if not extents.has_data:
+            raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
+        width = float(extents.size.x)
+        height = float(extents.size.y)
     if width <= 0 or height <= 0:
         raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
     margin_size = min(width, height) * margin / 100.0
