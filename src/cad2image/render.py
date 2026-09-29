@@ -187,9 +187,9 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
-    _remap_dimension_colors(doc)
+    _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
-    _remap_mleader_colors(doc)
+    _remap_mleader_properties(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -229,9 +229,9 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
     _remap_dimension_geometry_texts(doc)
-    _remap_dimension_colors(doc)
+    _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
-    _remap_mleader_colors(doc)
+    _remap_mleader_properties(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -488,17 +488,17 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
                     block_entity.dxf.text = new
 
 
-def _remap_dimension_colors(doc: ezdxf.document.Drawing) -> None:
-    """把 DIMENSION 几何块子实体的 ByBlock 颜色改成标注实体自身的颜色。
+def _remap_dimension_properties(doc: ezdxf.document.Drawing) -> None:
+    """把 DIMENSION 几何块子实体的 ByBlock 颜色/线宽改成标注实体自身的值。
 
-    ODA 转出的 DIMENSION 几何块内子实体（尺寸线、箭头、文字）颜色为 ByBlock（0），
-    语义是"继承标注实体颜色"。但 ezdxf 渲染 DIMENSION 时把几何块子实体当**虚拟实体**
-    处理（没有块引用上下文），ByBlock 会被解析成布局默认色（ACI 7 白/黑），而不是
-    标注实体自己的颜色 / 图层颜色——导致 CTB 里"使用对象颜色"对标注不生效、标注颜色
-    固定成 ACI 7。
+    ODA 转出的 DIMENSION 几何块内子实体（尺寸线、箭头、文字）颜色与线宽为 ByBlock（0 /
+    -2），语义是"继承标注实体"。但 ezdxf 渲染 DIMENSION 时把几何块子实体当**虚拟实体**
+    处理（没有块引用上下文），ByBlock 会被解析成布局默认值（颜色 ACI 7 白/黑、线宽
+    0.25mm），而不是标注实体自己的 / 图层的值——导致 CTB"使用对象颜色"对标注不生效、
+    线宽不认图层设置。
 
-    这里把几何块子实体的 ByBlock 颜色改为标注实体自身的颜色（ByLayer 256 或显式
-    ACI），使颜色解析回到正确链（ByLayer → 图层色 / 显式色），CTB 才能正确套用。
+    这里把几何块子实体的 ByBlock 颜色/线宽改为标注实体自身的值（ByLayer 或显式），
+    使解析回到正确链（ByLayer → 图层色/图层线宽 / 显式值）。
     """
     for layout in doc.layouts:
         for entity in layout:
@@ -508,9 +508,12 @@ def _remap_dimension_colors(doc: ezdxf.document.Drawing) -> None:
             if block is None:
                 continue
             dim_color = entity.dxf.color  # 默认 BYLAYER(256)，或显式 ACI，或 BYBLOCK(0)
+            dim_lineweight = entity.dxf.lineweight  # 默认 BYLAYER(-1)，或显式线宽
             for block_entity in block:
                 if block_entity.dxf.get("color", None) == ezdxf.const.BYBLOCK:
                     block_entity.dxf.color = dim_color
+                if block_entity.dxf.get("lineweight", None) == ezdxf.const.LINEWEIGHT_BYBLOCK:
+                    block_entity.dxf.lineweight = dim_lineweight
 
 
 def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
@@ -535,26 +538,29 @@ def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
                 entity.proxy_graphic = None
 
 
-def _remap_mleader_colors(doc: ezdxf.document.Drawing) -> None:
-    """把 MULTILEADER 引线/箭头/块内容的 ByBlock 颜色改回引线实体自身颜色。
+def _remap_mleader_properties(doc: ezdxf.document.Drawing) -> None:
+    """把 MULTILEADER 引线/箭头/块内容的 ByBlock 颜色/线宽改回引线实体自身值。
 
     ODA 转出的 MULTILEADER 的 CONTEXT_DATA 里，引线（leader line）与箭头块的颜色为
-    ByBlock(0)，ezdxf 渲染时这些虚拟实体被解析成布局默认色（ACI 7），而非引线实体的
-    颜色 / 图层颜色 → 引线颜色不随 CTB"使用对象颜色"变化。这里把 ByBlock 改成引线实体
-    的 ``dxf.color``（默认 ByLayer 256 或显式 ACI）。
+    ByBlock(0)，引线的线宽（``leader_lineweight``）也是 ByBlock(-2)。ezdxf 渲染时这些
+    虚拟实体被解析成布局默认值（颜色 ACI 7、线宽 0.25mm），而非引线实体的颜色 / 图层
+    颜色 / 图层线宽 → 引线颜色与线宽都不随图层 / CTB 变化。这里把 ByBlock 改成引线实体
+    的 ``dxf.color`` 与 ``dxf.lineweight``（默认 ByLayer）。
     """
     for layout in doc.layouts:
         for entity in layout:
             if not isinstance(entity, MultiLeader):
                 continue
-            target = ezdxf.colors.encode_raw_color(entity.dxf.color)  # 默认 BYLAYER(256)
+            target_color = ezdxf.colors.encode_raw_color(entity.dxf.color)  # 默认 BYLAYER(256)
             for leader in entity.context.leaders:
                 for line in leader.lines:
                     if line.color == ezdxf.colors.BY_BLOCK_RAW_VALUE:
-                        line.color = target
+                        line.color = target_color
             block = entity.context.block
             if block is not None and block.color == ezdxf.colors.BY_BLOCK_RAW_VALUE:
-                block.color = target
+                block.color = target_color
+            if entity.dxf.get("leader_lineweight", None) == ezdxf.const.LINEWEIGHT_BYBLOCK:
+                entity.dxf.leader_lineweight = entity.dxf.lineweight  # 默认 BYLAYER(-1)
 
 
 def _decode_multibyte_escapes(text: str) -> str:

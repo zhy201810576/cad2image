@@ -390,16 +390,16 @@ def test_remap_dimension_geometry_texts() -> None:
     assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
-def test_remap_dimension_colors() -> None:
-    """DIMENSION 几何块子实体的 ByBlock 颜色应改为标注实体自身的颜色。
+def test_remap_dimension_properties() -> None:
+    """DIMENSION 几何块子实体的 ByBlock 颜色/线宽应改为标注实体自身的值。
 
-    回归：ODA 转出的 DIMENSION 几何块子实体颜色为 ByBlock(0)，ezdxf 渲染时把虚拟实体
-    的 ByBlock 解析成布局默认色（ACI 7），而非标注实体颜色/图层色，导致 CTB"使用对象
-    颜色"对标注不生效。这里应把子实体颜色改成标注实体颜色，使颜色解析回到正确链。
+    回归：ODA 转出的 DIMENSION 几何块子实体颜色/线宽为 ByBlock，ezdxf 渲染时把虚拟实体
+    的 ByBlock 解析成布局默认值（颜色 ACI 7、线宽 0.25mm），而非标注实体/图层的值，导致
+    CTB"使用对象颜色"不生效、线宽不认图层设置。这里应把子实体改回标注实体的值。
     """
     import ezdxf
 
-    from cad2image.render import _remap_dimension_colors
+    from cad2image.render import _remap_dimension_properties
 
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
@@ -409,33 +409,37 @@ def test_remap_dimension_colors() -> None:
     block = dim.get_geometry_block()
     assert block is not None
 
-    # 模拟 ODA 输出：几何块子实体颜色为 ByBlock(0)，标注实体为显式绿色(3)
+    # 模拟 ODA 输出：几何块子实体颜色/线宽为 ByBlock，标注实体为显式绿色(3)、线宽 0.5mm(50)
     dim.dxf.color = 3
+    dim.dxf.lineweight = 50
     for e in block:
-        if e.dxftype() != "POINT":
-            e.dxf.color = 0
+        if e.dxftype() == "POINT":
+            continue
+        e.dxf.color = 0
+        e.dxf.lineweight = -2  # BYBLOCK
 
-    _remap_dimension_colors(doc)
+    _remap_dimension_properties(doc)
 
     for e in block:
         if e.dxftype() == "POINT":
             continue
         assert e.dxf.color == 3, (e.dxftype(), e.dxf.color)
+        assert e.dxf.lineweight == 50, (e.dxftype(), e.dxf.lineweight)
 
 
-def test_remap_mleader_colors() -> None:
-    """MULTILEADER 引线/箭头/块内容的 ByBlock 颜色应改回引线实体自身颜色。
+def test_remap_mleader_properties() -> None:
+    """MULTILEADER 引线/箭头/块内容的 ByBlock 颜色/线宽应改回引线实体自身值。
 
-    回归：ODA 转出的 MULTILEADER 引线颜色为 ByBlock(0)，ezdxf 渲染时把虚拟实体解析成
-    布局默认色（ACI 7），而非引线实体颜色/图层色，导致引线颜色不随 CTB"使用对象颜色"
-    变化。这里应把 ByBlock 改成引线实体的 dxf.color。
+    回归：ODA 转出的 MULTILEADER 引线颜色/线宽为 ByBlock，ezdxf 渲染时把虚拟实体解析成
+    布局默认值（颜色 ACI 7、线宽 0.25mm），而非引线实体/图层的值。这里应把 ByBlock 改回
+    引线实体的 dxf.color / dxf.lineweight。
     """
     import ezdxf
     from ezdxf.colors import BY_BLOCK_RAW_VALUE
     from ezdxf.math import Vec2
     from ezdxf.render.mleader import ConnectionSide, decode_raw_color
 
-    from cad2image.render import _remap_mleader_colors
+    from cad2image.render import _remap_mleader_properties
 
     doc = ezdxf.new("R2018")
     builder = doc.modelspace().add_multileader_mtext()
@@ -444,13 +448,16 @@ def test_remap_mleader_colors() -> None:
     builder.build(Vec2(10, 10))
     mleader = builder.multileader
     mleader.dxf.color = 3  # 显式绿色
+    mleader.dxf.lineweight = 50  # 显式 0.5mm
+    mleader.dxf.leader_lineweight = -2  # BYBLOCK
 
     line = mleader.context.leaders[0].lines[0]
     assert line.color == BY_BLOCK_RAW_VALUE
 
-    _remap_mleader_colors(doc)
+    _remap_mleader_properties(doc)
 
     assert decode_raw_color(line.color)[0] == 3, decode_raw_color(line.color)
+    assert mleader.dxf.leader_lineweight == 50, mleader.dxf.leader_lineweight
 
 
 def test_clear_mleader_proxy_graphics() -> None:
