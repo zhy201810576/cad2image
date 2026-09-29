@@ -15,6 +15,7 @@ venv/
 # 临时产物
 .wheels/
 _odatest/
+_diag/
 *.dwg
 *.dxf
 *.png

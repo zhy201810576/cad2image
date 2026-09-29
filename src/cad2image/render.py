@@ -8,6 +8,7 @@ SVG 走 ezdxf SVG 后端。渲染流程：
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 from contextlib import contextmanager
@@ -21,10 +22,12 @@ from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
 from ezdxf.addons.drawing.svg import SVGBackend
+from ezdxf.addons.drawing.unified_text_renderer import UnifiedTextRenderer
 from ezdxf.entities import Dimension, DXFGraphic, MultiLeader
+from ezdxf.enums import TextEntityAlignment
 from ezdxf.fonts import fonts as ezdxf_fonts
-from ezdxf.layouts import Layout
-from ezdxf.math import Vec2
+from ezdxf.layouts import BlockLayout, Layout
+from ezdxf.math import Vec2, Vec3
 
 from cad2image.config import RenderOptions, build_drawing_configuration
 
@@ -57,6 +60,34 @@ _GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8)}
 # "%c" 之类；这里展开为内置字体实际包含的字形（%%c → Ø 而非 U+2300，因宋体缺后者）。
 _AUTOCAD_CONTROL_RE = re.compile(r"%%[cCdDpP%]")
 _AUTOCAD_CONTROL_MAP = {"c": chr(0x00D8), "d": chr(0x00B0), "p": chr(0x00B1)}
+
+# 形位公差（TOLERANCE / AcDbFcf）内容里的 GDT 符号编码。AutoCAD 用 ``{\Fgdt;X}`` 内联
+# 切换到 gdt 符号字体、用单个字母 X 表示一个形位公差符号。映射依据 ObjectARX 文档
+# AcDbFcf::setText 的符号表（小写字母 → 形位公差符号、材料条件修饰符等）。
+# 直径符号 n 用 U+00D8 而非 U+2300，因为内置思源宋体缺 U+2300 字形（见 _GLYPH_FALLBACKS）。
+_GDT_SYMBOLS = {
+    "j": chr(0x2316),  # 位置度 ⌖
+    "r": chr(0x25CE),  # 同轴度/同心度 ◎
+    "i": chr(0x232F),  # 对称度 ⌯
+    "f": chr(0x2225),  # 平行度 ∥
+    "b": chr(0x22A5),  # 垂直度 ⊥
+    "a": chr(0x2220),  # 倾斜度 ∠
+    "g": chr(0x232D),  # 圆柱度 ⌭
+    "c": chr(0x25B1),  # 平面度 ▱
+    "e": chr(0x25CB),  # 圆度 ○
+    "u": chr(0x2500),  # 直线度 ─
+    "d": chr(0x2313),  # 面轮廓度 ⌓
+    "k": chr(0x2312),  # 线轮廓度 ⌒
+    "h": chr(0x2197),  # 圆跳动 ↗
+    "t": chr(0x2330),  # 全跳动 ⌰
+    "n": chr(0x00D8),  # 直径 Ø
+    "m": chr(0x24C2),  # 最大实体 Ⓜ
+    "l": chr(0x24C1),  # 最小实体 Ⓛ
+    "s": chr(0x24C8),  # 独立原则 Ⓢ
+    "p": chr(0x24C5),  # 投影公差带 Ⓟ
+}
+# 匹配 TOLERANCE 内容里的 ``\Fgdt;X`` 符号（不区分大小写）。
+_GDT_FONT_RE = re.compile(r"\\[Ff]gdt;([a-zA-Z])")
 
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
@@ -190,6 +221,8 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
+    _remap_mleader_text(doc)
+    _remap_tolerance_to_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -232,6 +265,8 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
+    _remap_mleader_text(doc)
+    _remap_tolerance_to_graphics(doc)
     dxf_layout = _select_layout(doc, options.layout_name)
     page = _determine_page(dxf_layout, options)
     drawing_config = build_drawing_configuration(options)
@@ -561,6 +596,187 @@ def _remap_mleader_properties(doc: ezdxf.document.Drawing) -> None:
                 block.color = target_color
             if entity.dxf.get("leader_lineweight", None) == ezdxf.const.LINEWEIGHT_BYBLOCK:
                 entity.dxf.leader_lineweight = entity.dxf.lineweight  # 默认 BYLAYER(-1)
+
+
+def _iter_mleaders(doc: ezdxf.document.Drawing) -> Iterator[MultiLeader]:
+    """遍历文档内所有 MULTILEADER 实体，覆盖模型/图纸空间与块定义。
+
+    与 :func:`_iter_text_entities` 同理：MULTILEADER 也可能存在于块定义（如标题栏、
+    图框），只遍历 ``doc.layouts`` 会漏掉块内引线文字。
+    """
+    for block in doc.blocks:
+        for entity in block:
+            if isinstance(entity, MultiLeader):
+                yield entity
+
+
+def _remap_mleader_text(doc: ezdxf.document.Drawing) -> None:
+    """重映射 MULTILEADER 内容 MTEXT 的字体/控制码，与普通文字走同一重映射链。
+
+    ezdxf 渲染 MULTILEADER 时，其内容来自 ``context.mtext.default_content``（组码 304）
+    并经由 ``make_mtext`` 转成普通 MTEXT 交给文字渲染器。ODA 转出的引线内容常带内联字体
+    （``\\fFangSong`` / ``\\fISOCPEUR``）与 AutoCAD 控制码（``%%c`` 直径等），而现有的
+    文字级重映射函数（``_iter_text_entities``）只处理 TEXT/MTEXT/ATTRIB/ATTDEF，**不覆盖
+    引线内容**——导致引线文字里的中文（内联 FangSong 命中失败 → 回退默认字体）变方框、
+    直径符号 ``%%c`` 不展开（原样渲染成 "%c"）。
+
+    这里把引线内容也解码 \\M+、展开 %%c/%%d/%%p、替换缺字形、剥离内联字体；并对含中文
+    但样式非中文字体的引线内容，把其样式句柄（``style_handle``）重指到内置中文字体样式，
+    与 :func:`_remap_cjk_text_styles` 对普通文字的处理对齐。
+    """
+    cjk_style = doc.styles.get(_ensure_cjk_style(doc))
+    cjk_handle = cjk_style.dxf.handle if cjk_style is not None else "0"
+    for entity in _iter_mleaders(doc):
+        mtext_data = entity.context.mtext
+        if mtext_data is None:
+            continue
+        raw = mtext_data.default_content
+        if not raw:
+            continue
+        new = _decode_multibyte_escapes(raw)
+        new = _expand_autocad_control_codes_in_text(new)
+        for src, dst in _GLYPH_FALLBACKS.items():
+            if src in new:
+                new = new.replace(src, dst)
+        new = _INLINE_FONT_RE.sub("", new)
+        if new != raw:
+            mtext_data.default_content = new
+        if _contains_cjk(new):
+            style = doc.entitydb.get(mtext_data.style_handle)
+            font = style.dxf.get("font", "") if style is not None else ""
+            if font != _OPEN_CJK_FONT and cjk_handle:
+                mtext_data.style_handle = cjk_handle
+
+
+def _convert_tolerance_cell(raw: str) -> str:
+    """把 TOLERANCE 单个单元格的原始文本转换为可渲染文本。
+
+    展开 GDT 符号（``\\Fgdt;X`` → Unicode 形位公差符号）、剥离内联字体与其它 MTEXT
+    格式码、去掉包裹的花括号，得到纯文本内容。
+    """
+    text = _GDT_FONT_RE.sub(lambda m: _GDT_SYMBOLS.get(m.group(1).lower(), m.group(0)), raw)
+    text = _INLINE_FONT_RE.sub("", text)
+    text = re.sub(r"\\[A-Za-z][^;]*;", "", text)
+    return text.replace("{", "").replace("}", "")
+
+
+def _parse_tolerance_content(content: str) -> list[str]:
+    """把 TOLERANCE 内容按 ``%%v`` 分隔成单元格文本，丢弃空单元格。
+
+    AutoCAD 的 TOLERANCE 编辑对话框会在内容里追加多余的 ``%%v``（仅用于对话框回填，
+    不参与实际渲染，见 ObjectARX AcDbFcf::setText 说明），这里直接丢弃空单元格，得到
+    实际的形位公差框格序列（首格符号、次格公差值、后续各格基准字母）。
+    """
+    return [_convert_tolerance_cell(cell) for cell in content.split("%%v") if cell.strip()]
+
+
+def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
+    """把 TOLERANCE（形位公差）实体转换为 ezdxf 可渲染的图形。
+
+    ezdxf 1.1.3 的 drawing 前端**不支持 TOLERANCE**：它既不在派发表里，也不实现
+    ``__virtual_entities__`` 协议，最终走 ``skip_entity`` 被整体丢弃 → 图纸上的同心度/
+    形位公差框（含基准框）全部缺失。
+
+    这里把每个 TOLERANCE 解析成框格序列（符号/公差值/基准），量取各格文字宽度后画成
+    矩形框 + 分隔竖线 + 居中文字，放进一个临时块，再用带旋转角的 INSERT 替换原实体。
+    这样既支持水平也支持垂直（``x_axis_vector`` 决定方向）的形位公差框，且 PNG/SVG
+    后端通用。
+    """
+    tolerances: list[tuple[BlockLayout, DXFGraphic]] = []
+    for block in doc.blocks:
+        for entity in block:
+            if entity.dxftype() == "TOLERANCE":
+                tolerances.append((block, entity))
+
+    if not tolerances:
+        return
+
+    # 文字宽度用内置中文字体（含拉丁与 GDT 符号字形）量取，保证框格宽度与渲染一致。
+    font_face = ezdxf_fonts.font_manager.get_font_face(_OPEN_CJK_FONT)
+    renderer = UnifiedTextRenderer()
+
+    for block, entity in tolerances:
+        cells = _parse_tolerance_content(entity.dxf.get("content", ""))
+        if not cells:
+            block.delete_entity(entity)
+            continue
+        text_height = _tolerance_text_height(doc, entity)
+        gap = text_height * 0.5  # 每格左右留白
+        box_height = text_height * 2.0  # 形位公差框高约为字高 2 倍
+
+        cell_widths: list[float] = []
+        for cell in cells:
+            width = 0.0 if not cell.strip() else renderer.get_text_line_width(cell, font_face, text_height)
+            cell_widths.append(width + gap * 2.0)
+
+        block_name = _build_tolerance_block(doc, entity, cells, cell_widths, box_height, text_height, gap)
+        direction = entity.dxf.get("x_axis_vector", (1.0, 0.0, 0.0))
+        angle = math.degrees(math.atan2(direction[1], direction[0]))
+        insert = Vec3(entity.dxf.insert)
+        attribs: dict[str, object] = {
+            "rotation": angle,
+            "layer": entity.dxf.layer,
+        }
+        block.add_blockref(block_name, insert, dxfattribs=attribs)
+        block.delete_entity(entity)
+
+
+def _tolerance_text_height(doc: ezdxf.document.Drawing, entity: DXFGraphic) -> float:
+    """读取 TOLERANCE 所用标注样式的文字高度（DIMTXT），默认 2.5。"""
+    dimstyle_name = entity.dxf.get("dimstyle", "")
+    dimstyle = doc.dimstyles.get(dimstyle_name) if dimstyle_name else None
+    if dimstyle is not None:
+        value = dimstyle.dxf.get("dimtxt", 2.5)
+        if value and value > 0:
+            return float(value)
+    return 2.5
+
+
+def _build_tolerance_block(
+    doc: ezdxf.document.Drawing,
+    entity: DXFGraphic,
+    cells: list[str],
+    cell_widths: list[float],
+    box_height: float,
+    text_height: float,
+    gap: float,
+) -> str:
+    """构建形位公差框块，返回块名。块内局部坐标：框左下角在 (0,0)，沿 +X 排布。
+
+    块内实体：
+        - 矩形框四条边（LINE）
+        - 单元格之间的分隔竖线（LINE）
+        - 每格居中文字（TEXT，使用内置中文字体样式）
+    最终由调用方以 ``x_axis_vector`` 的角度旋转 INSERT，实现水平/垂直框。
+    """
+    name = f"_cad2image_tol_{entity.dxf.handle}"
+    if name in doc.blocks:
+        return name
+    block = doc.blocks.new(name)
+    cjk_style = _ensure_cjk_style(doc)
+    total_width = sum(cell_widths)
+
+    # 框线：下、上、左、右
+    block.add_line((0, 0), (total_width, 0))
+    block.add_line((0, box_height), (total_width, box_height))
+    block.add_line((0, 0), (0, box_height))
+    block.add_line((total_width, 0), (total_width, box_height))
+
+    # 分隔竖线
+    x = 0.0
+    for i, width in enumerate(cell_widths):
+        x += width
+        if i < len(cell_widths) - 1:
+            block.add_line((x, 0), (x, box_height))
+
+    # 每格居中文字
+    x = 0.0
+    for cell, width in zip(cells, cell_widths):
+        text = block.add_text(cell, dxfattribs={"style": cjk_style, "height": text_height})
+        text.set_placement((x + width / 2.0, box_height / 2.0), align=TextEntityAlignment.MIDDLE_CENTER)
+        x += width
+
+    return name
 
 
 def _decode_multibyte_escapes(text: str) -> str:

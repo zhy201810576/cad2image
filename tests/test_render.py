@@ -620,3 +620,104 @@ def test_render_margin_is_symmetric(tmp_path: Path) -> None:
     bottom = height - 1 - ys.max()
     margins = [left, right, top, bottom]
     assert max(margins) - min(margins) <= 3, f"余量不对称：左{left} 右{right} 上{top} 下{bottom}"
+
+
+def test_parse_tolerance_content_maps_gdt_symbols() -> None:
+    """TOLERANCE 内容应展开 GDT 符号、丢弃空单元格，得到框格文本序列。
+
+    回归：ezdxf 1.1.3 不支持 TOLERANCE 渲染，形位公差框被整体丢弃。这里校验
+    ``{\\Fgdt;r}``（同心度）→ ◎、``{\\Fgdt;n}``（直径）→ Ø 的映射。
+    """
+    from cad2image.render import _parse_tolerance_content
+
+    cells = _parse_tolerance_content(r"{\Fgdt;r}%%v{\Fgdt;n}0.03%%v%%vA%%v%%v")
+    assert cells == ["◎", "Ø0.03", "A"]
+
+    # 纯基准框（只有基准字母）
+    cells = _parse_tolerance_content(r"%%v%%v%%vA%%v%%v")
+    assert cells == ["A"]
+
+
+def test_remap_mleader_text_expands_control_codes_and_inline_font() -> None:
+    """MULTILEADER 内容 MTEXT 应展开 %%c 并剥离内联字体，避免直径符号缺失/中文方框。
+
+    回归：ODA 转出的 MULTILEADER 内容带内联字体（``\\fISOCPEUR``/``\\fFangSong``）与
+    ``%%c`` 控制码，而文字级重映射函数只处理 TEXT/MTEXT/ATTRIB/ATTDEF，不覆盖引线内容
+    ——直径符号不展开、中文内联字体命中失败 → 方框。
+    """
+    import ezdxf
+    from ezdxf.math import Vec2
+    from ezdxf.render.mleader import ConnectionSide
+
+    from cad2image.render import _remap_mleader_text
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    builder = msp.add_multileader_mtext()
+    builder.add_leader_line(ConnectionSide.right, [Vec2(0, 0), Vec2(5, 5)])
+    builder.set_content(r"\A1;（{\fISOCPEUR|b0|i0|c134|p34;%%C}434外圆）")
+    builder.build(Vec2(10, 10))
+
+    _remap_mleader_text(doc)
+
+    content = builder.multileader.context.mtext.default_content
+    assert "%%c" not in content.lower()
+    assert "Ø" in content
+    assert "外圆" in content
+
+
+def test_remap_mleader_text_remaps_cjk_style() -> None:
+    """含中文的 MULTILEADER 内容应把样式句柄重指到内置中文字体样式，避免中文方框。"""
+    import ezdxf
+    from ezdxf.math import Vec2
+    from ezdxf.render.mleader import ConnectionSide
+
+    from cad2image.render import _remap_mleader_text, _remap_text_style_fonts
+
+    doc = ezdxf.new("R2018")
+    doc.styles.get("Standard").dxf.font = "arial.ttf"
+    msp = doc.modelspace()
+    builder = msp.add_multileader_mtext()
+    builder.add_leader_line(ConnectionSide.right, [Vec2(0, 0), Vec2(5, 5)])
+    builder.set_content(r"{\fFangSong|b0|i0|c134|p49;螺纹试铣块材料}")
+    builder.build(Vec2(10, 10))
+
+    _remap_text_style_fonts(doc)
+    _remap_mleader_text(doc)
+
+    style = doc.entitydb.get(builder.multileader.context.mtext.style_handle)
+    assert style.dxf.font == "SourceHanSerifSC-Regular.ttf"
+
+
+def test_remap_tolerance_to_graphics_creates_insert_block() -> None:
+    """TOLERANCE 实体应被转换为含框线/文字的块引用，而非被 ezdxf 丢弃。"""
+    import ezdxf
+
+    from cad2image.render import _remap_tolerance_to_graphics
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.new_entity(
+        "TOLERANCE",
+        dxfattribs={
+            "insert": (0, 0),
+            "content": r"{\Fgdt;r}%%v{\Fgdt;n}0.03%%v%%vA%%v%%v",
+            "dimstyle": "Standard",
+        },
+    )
+
+    _remap_tolerance_to_graphics(doc)
+
+    # TOLERANCE 应已被移除，代之以 INSERT
+    assert "TOLERANCE" not in [e.dxftype() for e in msp]
+    inserts = [e for e in msp if e.dxftype() == "INSERT"]
+    assert len(inserts) == 1
+    block = doc.blocks.get(inserts[0].dxf.name)
+    assert block is not None
+    # 块内应有框线（LINE）与文字（TEXT），文字含展开后的符号
+    texts = [e.dxf.text for e in block if e.dxftype() == "TEXT"]
+    assert any("◎" in t for t in texts)
+    assert any("Ø0.03" in t for t in texts)
+    assert any(t == "A" for t in texts)
+    assert sum(1 for e in block if e.dxftype() == "LINE") >= 4
+
