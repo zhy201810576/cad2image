@@ -20,6 +20,8 @@ _diag/
 *.dxf
 *.png
 *.svg
+*.dwl
+*.dwl2
 
 # IDE
 .idea/

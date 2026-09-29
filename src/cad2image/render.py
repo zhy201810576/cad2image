@@ -89,6 +89,12 @@ _GDT_SYMBOLS = {
 # 匹配 TOLERANCE 内容里的 ``\Fgdt;X`` 符号（不区分大小写）。
 _GDT_FONT_RE = re.compile(r"\\[Ff]gdt;([a-zA-Z])")
 
+# 思源宋体（TrueType）的 cap_height 约 0.734em，中文字符（1.0em 全宽）渲染宽度是字高的
+# 1/0.734 ≈ 1.36 倍；而原始 SHX 中文大字体（gbcbig/hztxt）中文字符宽度 = 1.0 字高。为对齐
+# SHX 原图的文字宽度，对含中文的文字实体把宽度因子设为 0.734，把中文压窄回 1.0 字高。
+# 代价：同一段文字里的西文/数字也会被压窄约 26%（仅影响含中文的标注，纯西文不受影响）。
+_CJK_WIDTH_FACTOR = 0.734
+
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
     """修复 PyMuPDF 1.24.11 的 Vec2 bug，并按页面较小边自动调整相对线宽。
@@ -217,6 +223,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_text_style_fonts(doc)
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
+    _remap_cjk_text_width(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
@@ -261,6 +268,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_text_style_fonts(doc)
     _remap_cjk_text_styles(doc)
     _remap_mtext_inline_fonts(doc)
+    _remap_cjk_text_width(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
     _clear_mleader_proxy_graphics(doc)
@@ -488,6 +496,40 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
         new = _INLINE_FONT_RE.sub("", raw)
         if new != raw:
             entity.dxf.text = new
+
+
+def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
+    """把含中文的文字实体宽度因子设为 0.734，压窄回 SHX 大字体宽度。
+
+    ezdxf 不支持 SHX 中文大字体（gbcbig/hztxt），中文用内置思源宋体（TrueType）替代。
+    TrueType 的 cap_height 约 0.734em，中文字符（1.0em 全宽）渲染宽度是字高的 1/0.734 ≈
+    1.36 倍；而 SHX 大字体中文字符宽度 = 1.0 字高。为对齐 SHX 原图、避免中文标注比原图
+    宽约 36% 而挤到相邻的序号圈/尺寸线，这里对含中文的文字把宽度因子设为 0.734。
+
+    只处理**含中文**的文字：纯西文（尺寸数字、序号等）宽度因子保持 1.0 不受影响。同一段
+    含中文的文字里的西文/数字也会被压窄约 26%，属于可接受的权衡。
+    """
+    factor = f"{_CJK_WIDTH_FACTOR}"
+    for entity in _iter_text_entities(doc):
+        raw = entity.dxf.get("text", "")
+        if not raw or not _contains_cjk(raw):
+            continue
+        if entity.dxftype() == "MTEXT":
+            if "\\W" not in raw:
+                entity.dxf.text = f"\\W{factor};" + raw
+        else:  # TEXT / ATTRIB / ATTDEF
+            entity.dxf.width = _CJK_WIDTH_FACTOR
+
+    # MULTILEADER 内容 MTEXT 不在这上面的 _iter_text_entities 覆盖范围，单独处理。
+    for entity in _iter_mleaders(doc):
+        mtext_data = entity.context.mtext
+        if mtext_data is None:
+            continue
+        raw = mtext_data.default_content
+        if not raw or not _contains_cjk(raw):
+            continue
+        if "\\W" not in raw:
+            mtext_data.default_content = f"\\W{factor};" + raw
 
 
 def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
@@ -741,7 +783,13 @@ def _build_tolerance_block(
     text_height: float,
     gap: float,
 ) -> str:
-    """构建形位公差框块，返回块名。块内局部坐标：框左下角在 (0,0)，沿 +X 排布。
+    """构建形位公差框块，返回块名。
+
+    块内局部坐标约定：insert 点是框的**文字方向起点 + 框高方向中线**（AutoCAD 的
+    TOLERANCE 插入点语义——引线/箭头的中线与框的垂直中线对齐，而非框左下角）。故：
+
+        - 文字方向（+X）：框从 ``0`` 到 ``total_width``（insert 是起点）。
+        - 框高方向（+Y）：框在 ``y=0`` 两侧对称（``±box_height/2``），中线与引线对齐。
 
     块内实体：
         - 矩形框四条边（LINE）
@@ -755,25 +803,26 @@ def _build_tolerance_block(
     block = doc.blocks.new(name)
     cjk_style = _ensure_cjk_style(doc)
     total_width = sum(cell_widths)
+    half_height = box_height / 2.0
 
-    # 框线：下、上、左、右
-    block.add_line((0, 0), (total_width, 0))
-    block.add_line((0, box_height), (total_width, box_height))
-    block.add_line((0, 0), (0, box_height))
-    block.add_line((total_width, 0), (total_width, box_height))
+    # 框线：下、上、左、右（上下对称，中线在 y=0）
+    block.add_line((0, -half_height), (total_width, -half_height))
+    block.add_line((0, half_height), (total_width, half_height))
+    block.add_line((0, -half_height), (0, half_height))
+    block.add_line((total_width, -half_height), (total_width, half_height))
 
     # 分隔竖线
     x = 0.0
     for i, width in enumerate(cell_widths):
         x += width
         if i < len(cell_widths) - 1:
-            block.add_line((x, 0), (x, box_height))
+            block.add_line((x, -half_height), (x, half_height))
 
-    # 每格居中文字
+    # 每格居中文字（中线在 y=0）
     x = 0.0
     for cell, width in zip(cells, cell_widths):
         text = block.add_text(cell, dxfattribs={"style": cjk_style, "height": text_height})
-        text.set_placement((x + width / 2.0, box_height / 2.0), align=TextEntityAlignment.MIDDLE_CENTER)
+        text.set_placement((x + width / 2.0, 0.0), align=TextEntityAlignment.MIDDLE_CENTER)
         x += width
 
     return name

@@ -721,3 +721,44 @@ def test_remap_tolerance_to_graphics_creates_insert_block() -> None:
     assert any(t == "A" for t in texts)
     assert sum(1 for e in block if e.dxftype() == "LINE") >= 4
 
+
+
+def test_remap_cjk_text_width_mtext_prefix() -> None:
+    r"""含中文的 MTEXT 应加 ``\W0.734;`` 前缀压窄，纯西文不动。
+
+    回归：ezdxf 不支持 SHX 中文大字体，中文用 TrueType 思源宋体替代后中文字符宽度是
+    字高的 1.36 倍，比 SHX 原图宽 36%，会挤到相邻的序号圈/尺寸线。这里对含中文的
+    MTEXT 加宽度因子前缀，把中文压窄回 1.0 字高。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_cjk_text_width
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_mtext("螺纹收尾1.27-2.54")
+    msp.add_mtext("123.45")
+
+    _remap_cjk_text_width(doc)
+
+    texts = list(msp)
+    assert texts[0].text.startswith("\\W0.734;"), texts[0].text
+    assert "\\W" not in texts[1].text, texts[1].text
+
+
+def test_remap_cjk_text_width_text_factor() -> None:
+    """含中文的 TEXT 实体应把宽度因子设为 0.734，纯西文保持原值。"""
+    import ezdxf
+
+    from cad2image.render import _remap_cjk_text_width
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_text("全部", dxfattribs={"height": 2.5})
+    msp.add_text("3.2", dxfattribs={"height": 2.5})
+
+    _remap_cjk_text_width(doc)
+
+    texts = list(msp)
+    assert abs(texts[0].dxf.width - 0.734) < 1e-6, texts[0].dxf.width
+    assert texts[1].dxf.width == 1.0, texts[1].dxf.width
