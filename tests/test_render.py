@@ -350,6 +350,24 @@ def test_expand_autocad_control_codes() -> None:
     assert entities[1].dxf.text == r"°C 100%"
 
 
+def test_expand_autocad_control_codes_decodes_unicode_escape() -> None:
+    """\\U+XXXX 转义应解码为对应 Unicode 字符（如 \\U+00B0 → °）。
+
+    回归：ODA 把部分非 ASCII 字符（角度符号 ° 等）转成 AutoCAD 的 Unicode 转义
+    ``\\U+XXXX``，ezdxf 不解析、会原样渲染成字面 "\\U+00B0"。
+    """
+    import ezdxf
+
+    from cad2image.render import _expand_autocad_control_codes
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_text(r"135\U+00B0", dxfattribs={"height": 10})
+
+    _expand_autocad_control_codes(doc)
+
+    assert list(doc.modelspace())[0].dxf.text == "135°"
+
+
 def test_expand_autocad_control_codes_keeps_plain_text() -> None:
     """无控制码的普通文本应原样保留（含单个 % 不误伤）。"""
     import ezdxf
@@ -722,6 +740,49 @@ def test_remap_tolerance_to_graphics_creates_insert_block() -> None:
     assert sum(1 for e in block if e.dxftype() == "LINE") >= 4
 
 
+def test_tolerance_text_height_reads_xdata_dimtxt_override() -> None:
+    """TOLERANCE 文字高度应优先取实体 XDATA 里 DSTYLE 覆盖的 DIMTXT（组码 140）。
+
+    回归：AutoCAD 的 TOLERANCE（AcDbFcf）把创建时的文字高度存在实体 XDATA（应用名
+    ``ACAD``、字符串 ``DSTYLE``）的组码 140 里，而实体 ``dimstyle`` 指向的样式 DIMTXT
+    只是默认值。图纸整体放大（如 6:1）时两者相差数倍，只读样式 DIMTXT 会把形位公差框
+    渲染得过小。
+    """
+    import ezdxf
+
+    from cad2image.render import _tolerance_text_height
+
+    doc = ezdxf.new("R2018")
+    doc.dimstyles.get("Standard").dxf.dimtxt = 2.5
+    msp = doc.modelspace()
+    entity = msp.new_entity(
+        "TOLERANCE",
+        dxfattribs={"insert": (0, 0), "content": "A", "dimstyle": "Standard"},
+    )
+    entity.set_xdata(
+        "ACAD",
+        [(1000, "DSTYLE"), (1002, "{"), (1070, 140), (1040, 10.5), (1002, "}")],
+    )
+
+    assert _tolerance_text_height(doc, entity) == 10.5
+
+
+def test_tolerance_text_height_falls_back_to_dimstyle() -> None:
+    """无 XDATA 覆盖时，TOLERANCE 文字高度回退到样式 DIMTXT。"""
+    import ezdxf
+
+    from cad2image.render import _tolerance_text_height
+
+    doc = ezdxf.new("R2018")
+    doc.dimstyles.get("Standard").dxf.dimtxt = 2.5
+    msp = doc.modelspace()
+    entity = msp.new_entity(
+        "TOLERANCE",
+        dxfattribs={"insert": (0, 0), "content": "A", "dimstyle": "Standard"},
+    )
+
+    assert _tolerance_text_height(doc, entity) == 2.5
+
 
 def test_remap_cjk_text_width_mtext_prefix() -> None:
     r"""含中文的 MTEXT 应加 ``\W0.734;`` 前缀压窄，纯西文不动。
@@ -1036,3 +1097,49 @@ def test_remap_cjk_text_width_wrap_skips_short_text_with_punct() -> None:
 
     mtext = list(msp)[0]
     assert r"\P" not in mtext.text, mtext.text
+
+
+def test_remap_leader_dimension_to_graphics_skips_incomplete() -> None:
+    """构造不完整的 DIMENSION（缺 text_midpoint）不应崩溃，且保留原实体。"""
+    import ezdxf
+
+    from cad2image.render import _remap_leader_dimension_to_graphics
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_linear_dim(base=(0, 0), p1=(0, 5), p2=(5, 5))
+    dim = list(msp.query("DIMENSION"))[0]
+    dim.dxf.dimtype = 163
+    dim.dxf.discard("defpoint2")
+
+    _remap_leader_dimension_to_graphics(doc)
+
+    assert len(list(msp.query("DIMENSION"))) == 1
+
+
+def test_remap_wide_polyline_to_graphics_expands_arrow() -> None:
+    """带宽度的 LWPOLYLINE（PL 画的箭头）应展开成 LINE + SOLID。
+
+    回归：ezdxf 1.1.3 的 TraceBuilder 对「宽度 0→W→0」的带宽度多段线（如坐标指引线
+    箭头）生成的带状多边形退化成零宽、渲染不可见。这里手动按每段宽度展开：零宽段画
+    LINE、有宽段画 SOLID。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_wide_polyline_to_graphics
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    pl = msp.add_lwpolyline([(0, 0), (100, 0), (125, 0)])
+    pl.set_points(
+        [(0, 0, 0.0, 0.0, 0.0), (100, 0, 10.0, 0.0, 0.0), (125, 0, 0.0, 0.0, 0.0)],
+        format="xyseb",
+    )
+
+    _remap_wide_polyline_to_graphics(doc)
+
+    assert "LWPOLYLINE" not in [e.dxftype() for e in msp]
+    solids = list(msp.query("SOLID"))
+    lines = list(msp.query("LINE"))
+    assert len(solids) == 1  # 箭头（有宽段）
+    assert len(lines) == 1  # 引线主体（零宽段）

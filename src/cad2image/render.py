@@ -83,6 +83,10 @@ class _EmbeddedImage(NamedTuple):
 # "%c" 之类；这里展开为内置字体实际包含的字形（%%c → Ø 而非 U+2300，因宋体缺后者）。
 _AUTOCAD_CONTROL_RE = re.compile(r"%%[cCdDpP%]")
 _AUTOCAD_CONTROL_MAP = {"c": chr(0x00D8), "d": chr(0x00B0), "p": chr(0x00B1)}
+# AutoCAD 的 Unicode 转义 ``\U+XXXX``（XXXX 为 4 位十六进制码点），如 ``\U+00B0`` → °。
+# ODA 把部分非 ASCII 字符（角度符号 ° 等）转成这种转义，ezdxf 不解析、会原样渲染成
+# 字面 ``\U+00B0``。
+_UNICODE_ESCAPE_RE = re.compile(r"\\U\+([0-9A-Fa-f]{4})")
 
 # 形位公差（TOLERANCE / AcDbFcf）内容里的 GDT 符号编码。AutoCAD 用 ``{\Fgdt;X}`` 内联
 # 切换到 gdt 符号字体、用单个字母 X 表示一个形位公差符号。映射依据 ObjectARX 文档
@@ -250,6 +254,8 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_width_wrap(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
+    _remap_leader_dimension_to_graphics(doc)
+    _remap_wide_polyline_to_graphics(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
@@ -304,6 +310,8 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_cjk_text_width_wrap(doc)
     _remap_dimension_geometry_texts(doc)
     _remap_dimension_properties(doc)
+    _remap_leader_dimension_to_graphics(doc)
+    _remap_wide_polyline_to_graphics(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
@@ -983,6 +991,100 @@ def _remap_dimension_properties(doc: ezdxf.document.Drawing) -> None:
                     block_entity.dxf.lineweight = dim_lineweight
 
 
+def _remap_leader_dimension_to_graphics(doc: ezdxf.document.Drawing) -> None:
+    """把 ODA 转出的「引线标注」DIMENSION 转成块+INSERT，绕过 ezdxf 的直径/半径渲染器。
+
+    ODA File Converter 会把 CAD 里的引线标注（leader annotation，如「防反孔」「重要：这两个
+    孔不锁」）转成 DIMENSION 实体：``dimtype = 128（文字用户定位）+ 32（块引用）+ 3/4（直径/
+    半径）``，且**缺 ``defpoint2``**（没有直径/半径测量点）。ezdxf 的
+    ``DimensionRenderer.dispatch`` 用 ``dimtype & 15`` 归一化后走 Diameter/Radius 渲染器，
+    该渲染器按「圆心 = defpoint 与 defpoint4 的中点」画箭头+中心标记，**不渲染
+    virtual_entities 里的水平+斜折引线 LINE** → 引线整体缺失（只剩文字）。
+
+    这里把满足判别条件的 DIMENSION 的 virtual_entities（引线 LINE + 箭头 SOLID + 文字
+    MTEXT）复制进临时块，再用 INSERT 替换原实体，直接渲染引线+箭头+文字。
+    """
+    fake: list[tuple[BlockLayout, Dimension]] = []
+    for block in doc.blocks:
+        for entity in block:
+            if (
+                isinstance(entity, Dimension)
+                and (entity.dxf.dimtype & 128)
+                and entity.dxf.get("defpoint2") is None
+            ):
+                fake.append((block, entity))
+
+    for block, entity in fake:
+        try:
+            virtual = list(entity.virtual_entities())
+        except (AttributeError, ValueError):
+            # DIMENSION 构造不完整（缺 text_midpoint 等），无法提取虚拟实体，保留原实体。
+            continue
+        graphics = [v for v in virtual if v.dxftype() in ("LINE", "SOLID", "MTEXT")]
+        if not graphics:
+            block.delete_entity(entity)
+            continue
+
+        name = f"_cad2image_ldim_{entity.dxf.handle}"
+        if name not in doc.blocks:
+            new_block = doc.blocks.new(name)
+            for graphic in graphics:
+                new_block.add_entity(graphic.copy())
+
+        # INSERT 放在原点：块内实体保留 WCS 绝对坐标，渲染位置不变。
+        attribs: dict[str, object] = {"layer": entity.dxf.layer}
+        color = entity.dxf.get("color", None)
+        if color is not None:
+            attribs["color"] = color
+        block.add_blockref(name, Vec3(0.0, 0.0, 0.0), dxfattribs=attribs)
+        block.delete_entity(entity)
+
+
+def _remap_wide_polyline_to_graphics(doc: ezdxf.document.Drawing) -> None:
+    """把带宽度的 LWPOLYLINE（PL 命令画的箭头）展开成 LINE + SOLID。
+
+    ezdxf 1.1.3 的 ``TraceBuilder`` 对「宽度 0→W→0」的带宽度多段线（如坐标指引线箭头：
+    细引线 + 末端三角形箭头）生成的带状多边形会退化成零宽、渲染不可见。这里手动按每段
+    宽度展开：零宽段画成 LINE，有宽段画成 SOLID（带状填充，末端尖点由重复顶点表达），
+    绕过该 bug。含弧段（bulge）的多段线保留原实体，交给 ezdxf 处理。
+    """
+    targets: list[tuple[BlockLayout, LWPolyline]] = []
+    for block in doc.blocks:
+        for entity in block:
+            if entity.dxftype() == "LWPOLYLINE" and entity.has_width:
+                targets.append((block, entity))
+
+    for block, entity in targets:
+        points = list(entity.lwpoints)  # (x, y, start_width, end_width, bulge)
+        if len(points) < 2:
+            continue
+        if any(pt[4] != 0.0 for pt in points):
+            continue
+        const_width = entity.dxf.get("const_width", None)
+        attribs: dict[str, object] = {"layer": entity.dxf.layer}
+        for i in range(len(points) - 1):
+            x0, y0, start_w, end_w, _ = points[i]
+            x1, y1 = points[i + 1][0], points[i + 1][1]
+            if const_width:
+                start_w = end_w = float(const_width)
+            p0 = Vec2(x0, y0)
+            p1 = Vec2(x1, y1)
+            if start_w == 0.0 and end_w == 0.0:
+                block.add_line(p0, p1, dxfattribs=attribs)
+                continue
+            direction = p1 - p0
+            length = direction.magnitude
+            if length < 1e-9:
+                continue
+            normal = Vec2(-direction.y / length, direction.x / length)
+            left0 = p0 + normal * (start_w / 2.0)
+            right0 = p0 - normal * (start_w / 2.0)
+            left1 = p1 + normal * (end_w / 2.0)
+            right1 = p1 - normal * (end_w / 2.0)
+            block.add_solid([left0, right0, left1, right1], dxfattribs=attribs)
+        block.delete_entity(entity)
+
+
 def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
     """清除 MULTILEADER 实体的代理图形（proxy graphic），强制走原生渲染。
 
@@ -1154,7 +1256,17 @@ def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
 
 
 def _tolerance_text_height(doc: ezdxf.document.Drawing, entity: DXFGraphic) -> float:
-    """读取 TOLERANCE 所用标注样式的文字高度（DIMTXT），默认 2.5。"""
+    """读取 TOLERANCE 的文字高度。
+
+    AutoCAD 用 ``TOLERANCE``（AcDbFcf）创建形位公差时，会把创建时刻的 DIMSTYLE 变量
+    覆盖（含 DIMTXT，组码 140）以 XDATA 形式挂在实体上（应用名 ``ACAD``、字符串
+    ``DSTYLE``）。这个值才是形位公差框的**真实文字高度**；实体 ``dimstyle`` 指向的
+    样式 DIMTXT 只是样式默认值，当图纸经过整体缩放（如 6:1 放大）时二者相差数倍。
+    故优先读 XDATA 覆盖，读不到再回退到样式 DIMTXT，最终默认 2.5。
+    """
+    override = _read_tolerance_dimtxt_override(entity)
+    if override is not None:
+        return override
     dimstyle_name = entity.dxf.get("dimstyle", "")
     dimstyle = doc.dimstyles.get(dimstyle_name) if dimstyle_name else None
     if dimstyle is not None:
@@ -1162,6 +1274,28 @@ def _tolerance_text_height(doc: ezdxf.document.Drawing, entity: DXFGraphic) -> f
         if value and value > 0:
             return float(value)
     return 2.5
+
+
+def _read_tolerance_dimtxt_override(entity: DXFGraphic) -> float | None:
+    """从 TOLERANCE 实体的 XDATA 读 DIMTXT（组码 140）覆盖值。
+
+    XDATA 结构（AutoCAD ``AcDbFcf`` 的 DSTYLE 覆盖）：
+    ``(1000 "DSTYLE") (1002 "{") (1070 140) (1040 <高度>) ... (1002 "}")``。
+    """
+    try:
+        if not entity.has_xdata("ACAD"):
+            return None
+        tags = list(entity.get_xdata("ACAD"))
+        for i, tag in enumerate(tags):
+            if tag.code == 1070 and tag.value == 140 and i + 1 < len(tags):
+                next_tag = tags[i + 1]
+                if next_tag.code == 1040:
+                    value = float(next_tag.value)
+                    if value > 0:
+                        return value
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
 
 
 def _build_tolerance_block(
@@ -1275,12 +1409,15 @@ def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
 
 
 def _expand_autocad_control_codes_in_text(text: str) -> str:
-    """展开单段文本里的 AutoCAD 控制码 ``%%c`` / ``%%d`` / ``%%p`` / ``%%%``。
+    """展开单段文本里的 AutoCAD 控制码与 Unicode 转义。
 
-    ``%%c`` → Ø（U+00D8）、``%%d`` → °（U+00B0）、``%%p`` → ±（U+00B1）、``%%%`` → ``%``。
-    ezdxf 不解析这些控制码、会原样渲染成 "%c" 之类，故渲染前统一展开为内置字体实际
-    包含的字形（宋体缺 U+2300，用有字形的 U+00D8）。
+    - ``\\U+XXXX`` → 对应 Unicode 字符（如 ``\\U+00B0`` → °，ODA 转出的角度符号）
+    - ``%%c`` → Ø（U+00D8）、``%%d`` → °（U+00B0）、``%%p`` → ±（U+00B1）、``%%%`` → ``%``
+
+    ezdxf 不解析这些控制码/转义、会原样渲染成 "%c" / "\\U+00B0" 之类，故渲染前统一展开
+    为内置字体实际包含的字形（宋体缺 U+2300，用有字形的 U+00D8）。
     """
+    text = _UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
     def repl(match: re.Match[str]) -> str:
         code = match.group(0)[2:]
@@ -1295,7 +1432,7 @@ def _expand_autocad_control_codes(doc: ezdxf.document.Drawing) -> None:
     """展开文档内所有文字实体的 AutoCAD 控制码（见 :func:`_expand_autocad_control_codes_in_text`）。"""
     for entity in _iter_text_entities(doc):
         raw = entity.dxf.get("text", "")
-        if not raw or "%%" not in raw:
+        if not raw or ("%%" not in raw and "\\U+" not in raw):
             continue
         new = _expand_autocad_control_codes_in_text(raw)
         if new != raw:
