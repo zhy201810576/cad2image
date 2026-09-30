@@ -577,9 +577,41 @@ _MTEXT_FORMAT_RE = re.compile(r"\\[fFhHsSaAtTcCqQwW]")
 # 折行 token 化：CJK 汉字/全角标点逐字拆，西文/数字/半角标点连续段作为不可拆整体。
 _CJK_WRAP_TOKEN_RE = re.compile(r"[⺀-鿿豈-﫿＀-￯]|[^⺀-鿿豈-﫿＀-￯]+")
 
+# 折行避头尾（CJK 行首/行尾禁则，即 CSS ``line-break: strict`` 规则）。全角标点与半角
+# 标点（``,`` ``.`` ``(`` ``)``）极易混淆，故逐项注释标注每个字符的含义。
+# 行首禁则：闭标点、点号不应出现在行首。
+_LINE_START_FORBIDDEN = (
+    "，。、；：！？"  # ，。、；：！？
+    "）〉》】〕〗"  # ）〉》】〕〗
+    "』”’…—～·"  # 』”’…—～·
+)
+# 行尾禁则：开括号、开引号不应出现在行尾。
+_LINE_END_FORBIDDEN = (
+    "（〈《【〔〖"  # （〈《【〔〖
+    "『“‘"  # 『“‘
+)
+
+
+def _apply_kinsoku(lines: list[str]) -> list[str]:
+    """按 CJK 避头尾规则修正折行结果：闭标点不落行首、开标点不落行尾。"""
+    if len(lines) < 2:
+        return lines
+    for i in range(len(lines) - 1):
+        if lines[i] and lines[i][-1] in _LINE_END_FORBIDDEN:
+            # 开标点被折到行尾：移到下一行开头。
+            ch = lines[i][-1]
+            lines[i] = lines[i][:-1]
+            lines[i + 1] = ch + lines[i + 1]
+        elif lines[i + 1] and lines[i + 1][0] in _LINE_START_FORBIDDEN and lines[i]:
+            # 闭标点被折到行首：把上一行末尾字符挪到本行开头，使闭标点退到第二个位置。
+            ch = lines[i][-1]
+            lines[i] = lines[i][:-1]
+            lines[i + 1] = ch + lines[i + 1]
+    return lines
+
 
 def _wrap_text_to_width(text: str, max_width: float, measure: Callable[[str], float]) -> list[str]:
-    """把文本按 ``max_width`` 折行：CJK 逐字拆、西文连续段整体，返回行列表。"""
+    """把文本按 ``max_width`` 折行：CJK 逐字拆、西文连续段整体，折行后按避头尾规则修正。"""
     tokens = _CJK_WRAP_TOKEN_RE.findall(text)
     lines: list[str] = []
     line = ""
@@ -592,7 +624,17 @@ def _wrap_text_to_width(text: str, max_width: float, measure: Callable[[str], fl
             line = candidate
     if line:
         lines.append(line)
-    return lines
+    return _apply_kinsoku(lines)
+
+
+# 折行溢出容差：ODA 转出的「无框宽约束」MTEXT 会把 width（组码 41）填成文字实际渲染宽度，
+# 而这里按 TrueType 测量再除以 0.734 的换算有两个误差源：(1) 浮点误差 ±1~2%；(2) 全角标点
+# 在 TrueType 里是全宽（≈1.0 字高）、SHX 里却是窄的（≈0.3~0.5 字高），导致含标点的短文字
+# 被高估——如「全部：」压窄后 7.5 比 ODA 的 width 5.9 宽 27%。若直接用 ``measure > width/0.734``
+# 判定，这类「CAD 里本为单行」的 MTEXT 会被误判超宽而折成「全/部：」。故把「是否折行」的阈值
+# 放宽 30%，只对压窄后明显超出框宽（>1.3 倍，即 CAD 里确有框宽约束自动折行）的 MTEXT 折行；
+# 折行后的每行宽度仍按精确的 ``max_width`` 计算，不放大。
+_WRAP_OVERFLOW_TOLERANCE = 1.30
 
 
 def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
@@ -636,7 +678,8 @@ def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
         def measure(text: str, _ch: float = char_height) -> float:
             return renderer.get_text_line_width(text, font_face, _ch)
 
-        if measure(raw) <= max_width:
+        # 加溢出容差，避免「无框宽约束、文字恰好占满宽度」的 MTEXT 被浮点误差误折行。
+        if measure(raw) <= max_width * _WRAP_OVERFLOW_TOLERANCE:
             continue
         lines = _wrap_text_to_width(raw, max_width, measure)
         if len(lines) <= 1:

@@ -935,3 +935,104 @@ def test_remap_cjk_text_width_wrap_skips_short_or_wide() -> None:
 
     texts = [e.text for e in msp]
     assert all(r"\P" not in t for t in texts), texts
+
+
+def test_wrap_text_to_width_kinsoku_start_forbidden() -> None:
+    """折行后闭标点（，）不应落在行首，应连带前一字一起换到下一行。"""
+    from cad2image.render import _wrap_text_to_width
+
+    def measure(t: str) -> float:
+        return float(len(t))
+
+    lines = _wrap_text_to_width("螺纹收尾，去毛刺", 4.0, measure)
+    assert lines == ["螺纹收", "尾，去毛刺"], lines
+
+
+def test_wrap_text_to_width_kinsoku_end_forbidden() -> None:
+    """折行后开标点（（）不应落在行尾，应移到下一行开头。"""
+    from cad2image.render import _wrap_text_to_width
+
+    def measure(t: str) -> float:
+        return float(len(t))
+
+    lines = _wrap_text_to_width("完成（余量", 3.0, measure)
+    assert lines == ["完成", "（余量"], lines
+
+
+def test_remap_cjk_text_width_wrap_keeps_attachment_point() -> None:
+    """折行只改 text、不改 attachment_point，多行对齐由 ezdxf 按锚点处理。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    # attachment_point=4（Middle left）：多行文字从 insert 点垂直居中堆叠。
+    msp.add_mtext(
+        "工步一：以B面为基准磨C面，C面磨削余量0.03以内",
+        dxfattribs={"width": 40.0, "char_height": 2.5, "attachment_point": 4},
+    )
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert r"\P" in mtext.text, mtext.text
+    assert mtext.dxf.attachment_point == 4
+
+
+def test_remap_cjk_text_width_wrap_skips_width_equals_text_width() -> None:
+    """无框宽约束（width≈文字实际宽度）的 MTEXT 不应被浮点误差误折行。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    # "螺纹有效长度" 6 字、char_height=2.5，文字实际宽度（SHX 下）≈15；ODA 把 width 填成 14.93。
+    msp.add_mtext("螺纹有效长度", dxfattribs={"width": 14.93, "char_height": 2.5})
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert r"\P" not in mtext.text, mtext.text
+
+
+def test_remap_cjk_text_width_wrap_still_wraps_narrow_width() -> None:
+    """框宽明显小于文字宽（真框宽约束，>1.3 倍）的 MTEXT 仍应折行。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    # 文字压窄后宽约 23×2.5=57.5，框宽 15 明显放不下（比例约 3.8）→ 应折行。
+    msp.add_mtext(
+        "工步一：以B面为基准磨C面，C面磨削余量0.03以内",
+        dxfattribs={"width": 15.0, "char_height": 2.5},
+    )
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert r"\P" in mtext.text, mtext.text
+
+
+def test_remap_cjk_text_width_wrap_skips_short_text_with_punct() -> None:
+    """含全角标点的短文字不应被误折行（TrueType 标点比 SHX 宽导致的高估）。"""
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    # "全部：" 压窄后约 7.5，ODA 的 width=5.9（SHX 里冒号是窄的），比例 1.27 < 1.30 → 不折。
+    msp.add_mtext("全部：", dxfattribs={"width": 5.9, "char_height": 2.5})
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert r"\P" not in mtext.text, mtext.text
