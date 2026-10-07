@@ -36,3 +36,6 @@ ODAFileConverter_v21.5.0/
 
 # 字体源文件（已随包内置到 src/cad2image/fonts/，根目录这份不入库）
 /SourceHanSerifSC-Regular.ttf
+
+# 黑白线型 CTB（本地测试打印样式表，不入库）
+黑白线型.ctb
