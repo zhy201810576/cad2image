@@ -328,6 +328,40 @@ def test_remap_missing_glyphs_diameter() -> None:
     assert list(doc.modelspace())[0].dxf.text == chr(0x00D8) + "10"
 
 
+def test_remap_missing_glyphs_empty_set_diameter() -> None:
+    """直径符号 U+2205（∅）应替换为 U+00D8（宋体全宽字形导致尺寸文字膨胀）。"""
+    import ezdxf
+
+    from cad2image.render import _remap_missing_glyphs
+
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_text(chr(0x2205) + "62-0.011", dxfattribs={"height": 10})
+    _remap_missing_glyphs(doc)
+    assert list(doc.modelspace())[0].dxf.text == chr(0x00D8) + "62-0.011"
+
+
+def test_scale_text_heights_scales_all_text() -> None:
+    """全局文字缩放：TEXT 高度与 MTEXT char_height 按系数缩放，factor=1.0 不改变。"""
+    import ezdxf
+
+    from cad2image.render import _scale_text_heights
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_text("A", dxfattribs={"height": 10.0})
+    msp.add_mtext("B", dxfattribs={"char_height": 25.0})
+
+    _scale_text_heights(doc, 0.8)
+
+    entities = list(msp)
+    assert entities[0].dxf.height == pytest.approx(8.0)
+    assert entities[1].dxf.char_height == pytest.approx(20.0)
+
+    _scale_text_heights(doc, 1.0)
+    assert entities[0].dxf.height == pytest.approx(8.0)
+    assert entities[1].dxf.char_height == pytest.approx(20.0)
+
+
 def test_expand_autocad_control_codes() -> None:
     """AutoCAD 控制码 %%c/%%d/%%p 应展开为 Ø/°/±，%%% 展开为字面 %。
 
@@ -656,6 +690,61 @@ def test_parse_tolerance_content_maps_gdt_symbols() -> None:
     assert cells == ["A"]
 
 
+def test_parse_tolerance_content_falls_back_missing_glyphs() -> None:
+    """缺字形的 GDT 符号应替换为视觉等价的有字形符号（对称度 ⌯ → ≡ 等）。
+
+    回归：思源宋体缺对称度 U+232F 等 5 个形位公差符号字形，渲染成 .notdef 方框。
+    """
+    from cad2image.render import _parse_tolerance_content
+
+    # {\Fgdt;i} = 对称度 U+232F → ≡ (U+2261)
+    cells = _parse_tolerance_content(r"{\Fgdt;i}%%v0.1%%v%%vA%%v%%v")
+    assert cells == ["≡", "0.1", "A"]
+
+    # 圆柱度 U+232D → ⊘、位置度 U+2316 → ⊕
+    assert _parse_tolerance_content(r"{\Fgdt;g}%%v{\Fgdt;j}") == ["⊘", "⊕"]
+
+
+def test_split_tolerance_cell_gdt_keeps_gdt_letters() -> None:
+    """GDT 字体优先时单元格应拆成 (text, is_gdt) 片段，保留 ``\\Fgdt;X`` 的字母 X。
+
+    标准 GDT 字体（GDT.shx / GDT.ttf）按 ObjectARX AcDbFcf::setText 符号表编码，小写字母
+    字符码即形位公差符号；普通文字（公差值/基准字母）作为非 GDT 片段。
+    """
+    from cad2image.render import _split_tolerance_cell_gdt
+
+    assert _split_tolerance_cell_gdt(r"{\Fgdt;r}") == [("r", True)]
+    assert _split_tolerance_cell_gdt(r"{\Fgdt;n}0.03") == [("n", True), ("0.03", False)]
+    assert _split_tolerance_cell_gdt("A") == [("A", False)]
+    # 大小写不敏感 + 符号后紧跟基准字母
+    assert _split_tolerance_cell_gdt(r"{\fgdt;m}A") == [("m", True), ("A", False)]
+
+
+def test_find_gdt_font_finds_in_font_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """GDT 字体应从附加字体目录按文件名（大小写不敏感）找到。"""
+    from cad2image import render as render_mod
+    from cad2image.render import _find_gdt_font
+
+    monkeypatch.setattr(render_mod, "_bundled_font_dir", lambda: tmp_path / "bundled")
+    (tmp_path / "bundled").mkdir()
+    font_dir = tmp_path / "extra"
+    font_dir.mkdir()
+    (font_dir / "GDT.ttf").write_bytes(b"x")
+
+    assert _find_gdt_font(str(font_dir)) == "GDT.ttf"
+
+
+def test_find_gdt_font_returns_none_when_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """无 GDT 字体时应返回 None（回退到 Unicode 展开）。"""
+    from cad2image import render as render_mod
+    from cad2image.render import _find_gdt_font
+
+    monkeypatch.setattr(render_mod, "_bundled_font_dir", lambda: tmp_path / "bundled")
+    (tmp_path / "bundled").mkdir()
+
+    assert _find_gdt_font("") is None
+
+
 def test_remap_mleader_text_expands_control_codes_and_inline_font() -> None:
     """MULTILEADER 内容 MTEXT 应展开 %%c 并剥离内联字体，避免直径符号缺失/中文方框。
 
@@ -738,6 +827,44 @@ def test_remap_tolerance_to_graphics_creates_insert_block() -> None:
     assert any("Ø0.03" in t for t in texts)
     assert any(t == "A" for t in texts)
     assert sum(1 for e in block if e.dxftype() == "LINE") >= 4
+
+
+def test_remap_tolerance_to_graphics_uses_gdt_font_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """检测到 GDT 字体时应保留 ``\\Fgdt;X`` 字母用 GDT 样式渲染，而非展开 Unicode。
+
+    用内置等宽字体充当"GDT 字体"验证分段渲染路径：GDT 符号字母（r/n）用 gdt 样式、
+    普通文字（0.03/A）用 cjk 样式。
+    """
+    import ezdxf
+
+    from cad2image import render as render_mod
+    from cad2image.render import _configure_fonts, _remap_tolerance_to_graphics
+
+    gdt_font = "NotoSansMono-Regular.ttf"
+    _configure_fonts("")  # 扫描 bundled fonts/，让 get_font_face 命中
+    monkeypatch.setattr(render_mod, "_find_gdt_font", lambda _font_dir: gdt_font)
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.new_entity(
+        "TOLERANCE",
+        dxfattribs={
+            "insert": (0, 0),
+            "content": r"{\Fgdt;r}%%v{\Fgdt;n}0.03%%v%%vA%%v%%v",
+            "dimstyle": "Standard",
+        },
+    )
+
+    _remap_tolerance_to_graphics(doc)
+
+    inserts = [e for e in msp if e.dxftype() == "INSERT"]
+    assert len(inserts) == 1
+    block = doc.blocks.get(inserts[0].dxf.name)
+    texts = [(e.dxf.text, e.dxf.style) for e in block if e.dxftype() == "TEXT"]
+    assert ("r", "_cad2image_gdt") in texts  # 同心度字母保留，用 gdt 样式
+    assert ("n", "_cad2image_gdt") in texts  # 直径字母保留，用 gdt 样式
+    assert ("0.03", "_cad2image_cjk") in texts  # 公差值用 cjk 样式
+    assert ("A", "_cad2image_cjk") in texts  # 基准字母用 cjk 样式
 
 
 def test_tolerance_text_height_reads_xdata_dimtxt_override() -> None:
@@ -1143,3 +1270,91 @@ def test_remap_wide_polyline_to_graphics_expands_arrow() -> None:
     lines = list(msp.query("LINE"))
     assert len(solids) == 1  # 箭头（有宽段）
     assert len(lines) == 1  # 引线主体（零宽段）
+
+
+def test_clamp_dpi_reduces_for_oversized_content() -> None:
+    """超大内容（如十几米的嵌入图片）在默认 dpi 下应自动下调 dpi 防 OOM。
+
+    回归：纯图片 CAD 里 OLE2FRAME 被放大到 16×10 米，dpi=100 光栅化需 10.7GB 内存、
+    dpi=300 需 96GB，进程被 OOM killer 杀死报 ``BrokenProcessPool``。这里验证
+    ``_clamp_dpi`` 按像素量上限下调 dpi。
+    """
+    from ezdxf.math import Vec2
+
+    from cad2image.render import _clamp_dpi, _EmbeddedImage
+
+    # 16328.6 × 10598 mm 的内容，dpi=100 下约 2682M 像素（远超 100M 上限）。
+    image = _EmbeddedImage(
+        image_bytes=b"",
+        corner_min=Vec2(0, 0),
+        corner_max=Vec2(16328.6, 10598.0),
+    )
+    clamped = _clamp_dpi(100, None, [image], RenderOptions())
+    assert clamped < 100
+    # 降幅后像素量应落在上限附近（约 100M），不会留几十 GB 的量。
+    mm_per_inch = 25.4
+    pixels = (16328.6 * clamped / mm_per_inch) * (10598.0 * clamped / mm_per_inch)
+    assert pixels <= 100_000_000 * 1.01
+
+
+def test_clamp_dpi_keeps_normal_content_unchanged() -> None:
+    """普通尺寸内容（像素量在上限内）应保持 dpi 不变。"""
+    from ezdxf.math import Vec2
+
+    from cad2image.render import _clamp_dpi, _EmbeddedImage
+
+    # 634 × 642 mm，dpi=300 下约 57M 像素，在 100M 上限内。
+    image = _EmbeddedImage(image_bytes=b"", corner_min=Vec2(0, 0), corner_max=Vec2(634, 642))
+    assert _clamp_dpi(300, None, [image], RenderOptions()) == 300
+
+
+def test_clamp_dpi_uses_explicit_page_size() -> None:
+    """显式 width_mm/height_mm 应优先于内容包围盒参与像素估算。"""
+    from cad2image.render import _clamp_dpi
+
+    # 显式 1000×1000 mm，dpi=300 下约 139M 像素，应略降。
+    options = RenderOptions(width_mm=1000.0, height_mm=1000.0)
+    clamped = _clamp_dpi(300, None, [], options)
+    assert clamped < 300
+    mm_per_inch = 25.4
+    pixels = (1000.0 * clamped / mm_per_inch) * (1000.0 * clamped / mm_per_inch)
+    assert pixels <= 100_000_000 * 1.01
+
+
+def test_resolve_dpi_uses_resolution_for_small_content() -> None:
+    """--resolution 目标长边像素应按内容长边换算 dpi，图小自动提 dpi 保证清晰度。
+
+    回归：固定 --dpi 下小图（如数车2 的 195×74mm）像素很少、模糊；--resolution 应
+    按内容长边换算 dpi，使长边达到目标像素。
+    """
+    from ezdxf.math import BoundingBox2d
+
+    from cad2image.render import _resolve_dpi
+
+    bbox = BoundingBox2d([(0.0, 0.0), (195.16, 74.29)])
+    dpi = _resolve_dpi(RenderOptions(dpi=100, resolution=2048), bbox, [])
+    assert dpi > 100  # 小图应自动提 dpi
+    # 长边像素应约等于目标分辨率（取整误差内）。
+    assert dpi * 195.16 / 25.4 == pytest.approx(2048, rel=0.01)
+
+
+def test_resolve_dpi_falls_back_to_dpi_when_no_resolution() -> None:
+    """未指定 --resolution 时退回固定 --dpi。"""
+    from ezdxf.math import BoundingBox2d
+
+    from cad2image.render import _resolve_dpi
+
+    bbox = BoundingBox2d([(0.0, 0.0), (195.16, 74.29)])
+    assert _resolve_dpi(RenderOptions(dpi=100), bbox, []) == 100
+
+
+def test_resolve_dpi_clamps_oversized_resolution() -> None:
+    """--resolution 换算出的 dpi 若导致超大页面，仍受像素上限钳制防 OOM。"""
+    from ezdxf.math import BoundingBox2d
+
+    from cad2image.render import _resolve_dpi
+
+    # 16m 长的超大内容，--resolution 4k 换算的 dpi 很小（~6），不会超上限。
+    bbox = BoundingBox2d([(0.0, 0.0), (16328.6, 10598.0)])
+    dpi = _resolve_dpi(RenderOptions(dpi=300, resolution=4096), bbox, [])
+    assert dpi <= 300

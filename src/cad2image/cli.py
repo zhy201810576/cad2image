@@ -15,7 +15,7 @@ from pathlib import Path
 import typer
 
 from cad2image.batch import BatchResult, process_directory
-from cad2image.config import RenderOptions
+from cad2image.config import RenderOptions, parse_resolution
 from cad2image.dwg2dxf import convert_dwg_to_dxf
 from cad2image.render import render_dxf
 
@@ -35,6 +35,7 @@ def render(
     input_path: Path = typer.Argument(..., exists=True, help="输入：DWG/DXF 文件，或包含 DWG 的目录"),
     output: Path = typer.Option(None, "--output", "-o", help="输出文件/目录；缺省与输入同目录"),
     dpi: int = typer.Option(300, "--dpi", help="PNG 分辨率（DPI）"),
+    resolution: str = typer.Option(None, "--resolution", help="目标分辨率（长边像素）：1k/2k/3k/4k 或正整数；优先于 --dpi"),
     output_format: str = typer.Option("png", "--format", "-f", help="输出格式：png / svg"),
     background: str = typer.Option("white", "--background", help="背景策略：default/white/black/off"),
     color: str = typer.Option("color", "--color", help="颜色策略：color/monochrome/grayscale/black/white"),
@@ -50,28 +51,31 @@ def render(
     height: float = typer.Option(None, "--height", help="页面高度（mm）"),
     fit: bool = typer.Option(False, "--fit", help="按内容包围盒自适应页面尺寸"),
     margin: float = typer.Option(3.0, "--margin", help="内容自适应页面时的四周余量（%，相对内容较小边）"),
+    text_scale: float = typer.Option(1.0, "--text-scale", help="全局文字缩放系数（0.8=文字缩小 20%）"),
     recursive: bool = typer.Option(False, "--recursive", help="目录批量时递归处理子目录"),
     oda_path: Path = typer.Option(None, "--oda-path", help="ODAFileConverter.exe 路径；缺省从环境变量/默认路径解析"),
 ) -> None:
     """把 DWG/DXF 渲染为 PNG 或 SVG。"""
-    options = RenderOptions(
-        dpi=dpi,
-        background=background,
-        color_policy=color,
-        lineweight_policy=lineweight,
-        lineweight_scaling=lineweight_scaling,
-        min_lineweight=min_lineweight,
-        relative_max_stroke_width=relative_max_stroke_width,
-        relative_min_stroke_width=relative_min_stroke_width,
-        ctb=ctb,
-        font_dir=font_dir,
-        layout_name=layout,
-        width_mm=width,
-        height_mm=height,
-        fit_to_extents=fit,
-        margin=margin,
-    )
     try:
+        options = RenderOptions(
+            dpi=dpi,
+            resolution=parse_resolution(resolution),
+            background=background,
+            color_policy=color,
+            lineweight_policy=lineweight,
+            lineweight_scaling=lineweight_scaling,
+            min_lineweight=min_lineweight,
+            relative_max_stroke_width=relative_max_stroke_width,
+            relative_min_stroke_width=relative_min_stroke_width,
+            ctb=ctb,
+            font_dir=font_dir,
+            layout_name=layout,
+            width_mm=width,
+            height_mm=height,
+            fit_to_extents=fit,
+            margin=margin,
+            text_scale=text_scale,
+        )
         _run(input_path, output, options, output_format, recursive, oda_path)
     except (FileNotFoundError, ValueError, RuntimeError, NotImplementedError) as exc:
         typer.echo(f"错误：{exc}", err=True)

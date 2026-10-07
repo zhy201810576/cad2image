@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from cad2image.config import RenderOptions, build_drawing_configuration, get_oda_converter_path
+from cad2image.config import (
+    RenderOptions,
+    build_drawing_configuration,
+    get_oda_converter_path,
+    parse_resolution,
+)
 
 
 def test_get_oda_converter_path_returns_default() -> None:
@@ -78,3 +83,37 @@ def test_invalid_relative_min_stroke_width_raises() -> None:
     """非正相对线宽最细比例抛出 ValueError。"""
     with pytest.raises(ValueError, match="最细"):
         build_drawing_configuration(RenderOptions(relative_min_stroke_width=-1.0))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1k", 1024), ("2k", 2048), ("3k", 3072), ("4k", 4096), ("2K", 2048)],
+)
+def test_parse_resolution_presets(value: str, expected: int) -> None:
+    """--resolution 预设短名（大小写不敏感）映射为长边像素。"""
+    assert parse_resolution(value) == expected
+
+
+def test_parse_resolution_custom_pixels() -> None:
+    """--resolution 支持纯数字自定义长边像素。"""
+    assert parse_resolution("3000") == 3000
+    assert parse_resolution(" 2048 ") == 2048
+
+
+def test_parse_resolution_none_means_dpi() -> None:
+    """未指定 --resolution 时返回 None（回退 --dpi）。"""
+    assert parse_resolution(None) is None
+
+
+def test_parse_resolution_invalid_raises() -> None:
+    """非法 --resolution 取值 fail-fast 抛出 ValueError。"""
+    with pytest.raises(ValueError, match="resolution"):
+        parse_resolution("abc")
+    with pytest.raises(ValueError, match="resolution"):
+        parse_resolution("0")
+
+
+def test_invalid_resolution_raises() -> None:
+    """非正目标分辨率抛出 ValueError。"""
+    with pytest.raises(ValueError, match="目标分辨率"):
+        build_drawing_configuration(RenderOptions(resolution=0))

@@ -54,9 +54,13 @@ _TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 # 覆盖后文本统一回落到已 remap 到内置字体的样式字体，渲染正确。
 _INLINE_FONT_RE = re.compile(r"\\[fF][^;]*;")
 
-# 内置字体缺少字形的符号 → 视觉等价的有字形符号。思源宋体（SourceHanSerifSC）缺少
-# 直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，保证直径符号可见。
-_GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8)}
+# 内置字体缺少字形、或字形宽度与 CAD 窄字体差异过大的符号 → 视觉等价的有字形符号。
+# 直径符号的两种常见码点都落到思源宋体有字形、且宽度更接近 CAD 窄字体的 U+00D8（Ø）：
+# - U+2300（⌀）：思源宋体缺字形（渲染成 .notdef 方框），必须替换。
+# - U+2205（∅）：思源宋体有字形但是全宽 1.0em（约 1.36 倍字高）。而 CAD 原图里的窄字体
+#   （MS PGothic 等）把直径符号画成半宽 0.5em。全宽 ∅ 会让尺寸标注文字横向膨胀 6%~43%、
+#   挤压到旁边的序号圈；换成 0.767em（约 1.05 倍字高）的 Ø 可把膨胀降到 1%~22%。
+_GLYPH_FALLBACKS = {chr(0x2300): chr(0x00D8), chr(0x2205): chr(0x00D8)}
 
 # OLE 复合文档（Compound File Binary Format）魔数。DWG 里「粘贴的图片」绝大多数存成
 # OLE2FRAME 实体，其二进制数据（组码 310）在偏移 128 处起是这个魔数，之后是完整的 OLE
@@ -116,11 +120,33 @@ _GDT_SYMBOLS = {
 # 匹配 TOLERANCE 内容里的 ``\Fgdt;X`` 符号（不区分大小写）。
 _GDT_FONT_RE = re.compile(r"\\[Ff]gdt;([a-zA-Z])")
 
+# GDT 符号里内置思源宋体缺字形的 → 视觉等价的有字形符号（近似）。思源宋体缺少下面 5 个
+# 形位公差符号的字形（渲染成 .notdef 方框），用形状最接近的有字形符号替代，保证符号可见。
+_GDT_FALLBACKS = {
+    chr(0x232F): chr(0x2261),  # 对称度 ⌯ → ≡（三条横线）
+    chr(0x232D): chr(0x2298),  # 圆柱度 ⌭ → ⊘（圆 + 斜线）
+    chr(0x2316): chr(0x2295),  # 位置度 ⌖ → ⊕（圆 + 十字）
+    chr(0x2313): chr(0x2229),  # 面轮廓度 ⌓ → ∩（开口向下的半圆）
+    chr(0x2330): chr(0x21CC),  # 全跳动 ⌰ → ⇌（弧 + 箭头近似）
+}
+
+# 用户可随包 / 通过 ``--font-dir`` 提供的 GDT 符号字体文件名（大小写不敏感）。AutoCAD 的
+# 标准 GDT 字体（GDT.shx / GDT.ttf）按 ObjectARX AcDbFcf::setText 的符号表编码：小写字母
+# 的字符码即形位公差符号（``r``=同心度、``i``=对称度、``n``=直径…）。若检测到这种字体，
+# TOLERANCE 渲染优先用它直接渲染 ``\\Fgdt;X`` 的字母 X（得到精确矢量符号），否则回退到
+# Unicode 展开 + 近似符号（见 :data:`_GDT_SYMBOLS` / :data:`_GDT_FALLBACKS`）。
+_GDT_FONT_FILENAMES = ("gdt.ttf", "gdt.otf", "gdt.shx")
+
 # 思源宋体（TrueType）的 cap_height 约 0.734em，中文字符（1.0em 全宽）渲染宽度是字高的
 # 1/0.734 ≈ 1.36 倍；而原始 SHX 中文大字体（gbcbig/hztxt）中文字符宽度 = 1.0 字高。为对齐
 # SHX 原图的文字宽度，对含中文的文字实体把宽度因子设为 0.734，把中文压窄回 1.0 字高。
 # 代价：同一段文字里的西文/数字也会被压窄约 26%（仅影响含中文的标注，纯西文不受影响）。
 _CJK_WIDTH_FACTOR = 0.734
+
+# 输出像素总量上限（约 1 亿）。部分图纸把嵌入图片（OLE2FRAME）放大到十几米的物理尺寸，
+# 默认 dpi=300 光栅化会产出几十 GB 内存的 pixmap，触发 OOM 被系统杀死（报
+# ``BrokenProcessPool``）。渲染前按此上限钳制 dpi，仅对超大页面生效，普通图纸不受影响。
+_MAX_OUTPUT_PIXELS = 100_000_000
 
 
 class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
@@ -260,7 +286,8 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
     _snap_leader_arrowheads(doc)
-    _remap_tolerance_to_graphics(doc)
+    _remap_tolerance_to_graphics(doc, options.font_dir)
+    _scale_text_heights(doc, options.text_scale)
     dxf_layout = _select_layout(doc, options.layout_name)
     drawing_config = build_drawing_configuration(options)
     embedded_images = _extract_ole_images(dxf_layout)
@@ -271,13 +298,14 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     # 用实际渲染内容（已排除 invisible/隐藏实体）确定页面，避免离群实体撑大页面、图形缩小。
     page = _determine_page(dxf_layout, options, backend.player().bbox())
     settings = _build_render_settings(options)
+    dpi = _resolve_dpi(options, backend.player().bbox(), embedded_images)
     with _defer_content_wrap():
         if embedded_images:
             image_bytes = _render_pixmap_with_images(
-                backend, page, settings, options.dpi, embedded_images
+                backend, page, settings, dpi, embedded_images
             )
         else:
-            image_bytes = backend.get_pixmap_bytes(page, fmt="png", dpi=options.dpi, settings=settings)
+            image_bytes = backend.get_pixmap_bytes(page, fmt="png", dpi=dpi, settings=settings)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(image_bytes)
@@ -316,7 +344,8 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
     _snap_leader_arrowheads(doc)
-    _remap_tolerance_to_graphics(doc)
+    _remap_tolerance_to_graphics(doc, options.font_dir)
+    _scale_text_heights(doc, options.text_scale)
     dxf_layout = _select_layout(doc, options.layout_name)
     drawing_config = build_drawing_configuration(options)
 
@@ -1144,6 +1173,35 @@ def _iter_mleaders(doc: ezdxf.document.Drawing) -> Iterator[MultiLeader]:
                 yield entity
 
 
+def _scale_text_heights(doc: ezdxf.document.Drawing, factor: float) -> None:
+    """把所有文字实体的高度统一乘以 ``factor``（全局文字缩放）。
+
+    覆盖 TEXT/ATTRIB/ATTDEF 的 ``dxf.height``、MTEXT 的 ``dxf.char_height``（含
+    DIMENSION 几何块内的尺寸文字，因其匿名块在 ``doc.blocks`` 里），以及 MULTILEADER
+    内容的 ``context.char_height``。MTEXT 内联相对高度 ``\\H<factor>x``（带 x 后缀）随
+    基础高度缩放、无需单独处理；绝对高度 ``\\H<height>;`` 极罕见，暂不处理。
+
+    Args:
+        doc: 已重映射的 DXF 文档。
+        factor: 缩放系数（> 0）。等于 1.0 时直接返回。
+    """
+    if abs(factor - 1.0) < 1e-9:
+        return
+    for entity in _iter_text_entities(doc):
+        if entity.dxftype() == "MTEXT":
+            char_height = entity.dxf.get("char_height")
+            if char_height:
+                entity.dxf.char_height = char_height * factor
+        else:  # TEXT / ATTRIB / ATTDEF
+            height = entity.dxf.get("height")
+            if height:
+                entity.dxf.height = height * factor
+    for entity in _iter_mleaders(doc):
+        char_height = entity.context.char_height
+        if char_height:
+            entity.context.char_height = char_height * factor
+
+
 def _remap_mleader_text(doc: ezdxf.document.Drawing) -> None:
     """重映射 MULTILEADER 内容 MTEXT 的字体/控制码，与普通文字走同一重映射链。
 
@@ -1182,20 +1240,51 @@ def _remap_mleader_text(doc: ezdxf.document.Drawing) -> None:
                 mtext_data.style_handle = cjk_handle
 
 
-def _convert_tolerance_cell(raw: str) -> str:
-    """把 TOLERANCE 单个单元格的原始文本转换为可渲染文本。
-
-    展开 GDT 符号（``\\Fgdt;X`` → Unicode 形位公差符号）、剥离内联字体与其它 MTEXT
-    格式码、去掉包裹的花括号，得到纯文本内容。
-    """
-    text = _GDT_FONT_RE.sub(lambda m: _GDT_SYMBOLS.get(m.group(1).lower(), m.group(0)), raw)
+def _strip_tolerance_formatting(text: str) -> str:
+    """剥离 TOLERANCE 单元格里的内联字体/MTEXT 格式码与花括号，得到纯文本。"""
     text = _INLINE_FONT_RE.sub("", text)
     text = re.sub(r"\\[A-Za-z][^;]*;", "", text)
     return text.replace("{", "").replace("}", "")
 
 
+def _convert_tolerance_cell(raw: str) -> str:
+    """把 TOLERANCE 单个单元格的原始文本转换为可渲染文本。
+
+    展开 GDT 符号（``\\Fgdt;X`` → Unicode 形位公差符号，缺字形时用
+    :data:`_GDT_FALLBACKS` 近似）、剥离内联字体与其它 MTEXT 格式码、去掉包裹的
+    花括号，得到纯文本内容。
+    """
+    text = _GDT_FONT_RE.sub(lambda m: _GDT_SYMBOLS.get(m.group(1).lower(), m.group(0)), raw)
+    for src, dst in _GDT_FALLBACKS.items():
+        text = text.replace(src, dst)
+    return _strip_tolerance_formatting(text)
+
+
+def _split_tolerance_cell_gdt(raw: str) -> list[tuple[str, bool]]:
+    """把单个 TOLERANCE 单元格拆成 ``(text, is_gdt)`` 片段，供 GDT 字体优先渲染。
+
+    匹配 ``\\Fgdt;X`` 符号片段并保留字母 X（标准 GDT 字体里 X 的字符码即该形位公差
+    符号，见 :data:`_GDT_FONT_FILENAMES` 说明），标记 ``is_gdt=True``；其余文字
+    （公差值、基准字母等）作为普通片段。普通片段同样剥离内联字体/格式码/花括号。
+    """
+    segments: list[tuple[str, bool]] = []
+    pos = 0
+    for match in _GDT_FONT_RE.finditer(raw):
+        if match.start() > pos:
+            plain = _strip_tolerance_formatting(raw[pos:match.start()])
+            if plain:
+                segments.append((plain, False))
+        segments.append((match.group(1), True))
+        pos = match.end()
+    if pos < len(raw):
+        plain = _strip_tolerance_formatting(raw[pos:])
+        if plain:
+            segments.append((plain, False))
+    return segments
+
+
 def _parse_tolerance_content(content: str) -> list[str]:
-    """把 TOLERANCE 内容按 ``%%v`` 分隔成单元格文本，丢弃空单元格。
+    """把 TOLERANCE 内容按 ``%%v`` 分隔成单元格，丢弃空单元格。
 
     AutoCAD 的 TOLERANCE 编辑对话框会在内容里追加多余的 ``%%v``（仅用于对话框回填，
     不参与实际渲染，见 ObjectARX AcDbFcf::setText 说明），这里直接丢弃空单元格，得到
@@ -1204,7 +1293,42 @@ def _parse_tolerance_content(content: str) -> list[str]:
     return [_convert_tolerance_cell(cell) for cell in content.split("%%v") if cell.strip()]
 
 
-def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
+def _find_gdt_font(font_dir: str) -> str | None:
+    """在随包 ``fonts/`` 与用户 ``--font-dir`` 里查找 GDT 符号字体，返回文件名或 ``None``。
+
+    只做文件系统查找（大小写不敏感，见 :data:`_GDT_FONT_FILENAMES`）；字体扫描由
+    :func:`_configure_fonts` 在渲染前统一完成，这里不重复 ``scan_folder``（避免并发
+    渲染时的线程安全问题）。
+    """
+    directories = [_bundled_font_dir()]
+    if font_dir:
+        directories.append(Path(font_dir))
+    for directory in directories:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file() and entry.name.lower() in _GDT_FONT_FILENAMES:
+                return entry.name
+    return None
+
+
+def _ensure_gdt_style(doc: ezdxf.document.Drawing, gdt_font: str) -> str:
+    """返回一个指向 GDT 符号字体的文字样式名，不存在则创建。
+
+    用于 TOLERANCE 里 ``\\Fgdt;X`` 片段：样式 font 指向 GDT 字体，字母 X 渲染为该字体
+    的形位公差符号。优先复用已指向该字体的既有样式，避免重复创建。
+    """
+    for style in doc.styles:
+        if style.dxf.get("font", "").lower() == gdt_font.lower():
+            return str(style.dxf.name)
+    name = "_cad2image_gdt"
+    doc.styles.add(name, font=gdt_font)
+    return name
+
+
+def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing, font_dir: str = "") -> None:
     """把 TOLERANCE（形位公差）实体转换为 ezdxf 可渲染的图形。
 
     ezdxf 1.1.3 的 drawing 前端**不支持 TOLERANCE**：它既不在派发表里，也不实现
@@ -1215,6 +1339,15 @@ def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
     矩形框 + 分隔竖线 + 居中文字，放进一个临时块，再用带旋转角的 INSERT 替换原实体。
     这样既支持水平也支持垂直（``x_axis_vector`` 决定方向）的形位公差框，且 PNG/SVG
     后端通用。
+
+    GDT 符号渲染有两种策略：若在项目 ``fonts/`` 或 ``font_dir`` 里检测到 GDT 符号字体
+    （见 :func:`_find_gdt_font`），则保留 ``\\Fgdt;X`` 的字母 X 用该字体直接渲染，得到
+    精确矢量符号；否则展开为 Unicode 字符（缺字形时用近似符号，见
+    :func:`_parse_tolerance_content`）。
+
+    Args:
+        doc: 源 DXF 文档。
+        font_dir: 附加字体目录，用于查找 GDT 符号字体（空字符串表示只查项目 ``fonts/``）。
     """
     tolerances: list[tuple[BlockLayout, DXFGraphic]] = []
     for block in doc.blocks:
@@ -1225,12 +1358,31 @@ def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
     if not tolerances:
         return
 
-    # 文字宽度用内置中文字体（含拉丁与 GDT 符号字形）量取，保证框格宽度与渲染一致。
-    font_face = ezdxf_fonts.font_manager.get_font_face(_OPEN_CJK_FONT)
+    gdt_font = _find_gdt_font(font_dir)
+    gdt_face = None
+    if gdt_font:
+        face = ezdxf_fonts.font_manager.get_font_face(gdt_font)
+        if face is not None and face.filename.lower() == gdt_font.lower():
+            gdt_face = face
+        else:
+            # 字体文件存在但未被扫描进字体管理器（回退 arial），降级到 Unicode 展开。
+            gdt_font = None
+    gdt_style_name = _ensure_gdt_style(doc, gdt_font) if gdt_font else None
+    cjk_style_name = _ensure_cjk_style(doc)
+    cjk_face = ezdxf_fonts.font_manager.get_font_face(_OPEN_CJK_FONT)
     renderer = UnifiedTextRenderer()
 
     for block, entity in tolerances:
-        cells = _parse_tolerance_content(entity.dxf.get("content", ""))
+        content = entity.dxf.get("content", "")
+        if gdt_style_name:
+            # 每个 cell 是 [(text, style_name), ...] 片段：GDT 符号用 gdt 样式、其余用 cjk 样式。
+            cells = [
+                [(text, gdt_style_name if is_gdt else cjk_style_name)
+                 for text, is_gdt in _split_tolerance_cell_gdt(cell)]
+                for cell in content.split("%%v") if cell.strip()
+            ]
+        else:
+            cells = [[(text, cjk_style_name)] for text in _parse_tolerance_content(content)]
         if not cells:
             block.delete_entity(entity)
             continue
@@ -1239,11 +1391,22 @@ def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing) -> None:
         box_height = text_height * 2.0  # 形位公差框高约为字高 2 倍
 
         cell_widths: list[float] = []
+        segment_widths: list[list[float]] = []
         for cell in cells:
-            width = 0.0 if not cell.strip() else renderer.get_text_line_width(cell, font_face, text_height)
-            cell_widths.append(width + gap * 2.0)
+            widths = [
+                renderer.get_text_line_width(
+                    text,
+                    gdt_face if (gdt_style_name and style == gdt_style_name) else cjk_face,
+                    text_height,
+                )
+                for text, style in cell
+            ]
+            segment_widths.append(widths)
+            cell_widths.append(sum(widths) + gap * 2.0)
 
-        block_name = _build_tolerance_block(doc, entity, cells, cell_widths, box_height, text_height, gap)
+        block_name = _build_tolerance_block(
+            doc, entity, cells, segment_widths, cell_widths, box_height, text_height, gap
+        )
         direction = entity.dxf.get("x_axis_vector", (1.0, 0.0, 0.0))
         angle = math.degrees(math.atan2(direction[1], direction[0]))
         insert = Vec3(entity.dxf.insert)
@@ -1301,7 +1464,8 @@ def _read_tolerance_dimtxt_override(entity: DXFGraphic) -> float | None:
 def _build_tolerance_block(
     doc: ezdxf.document.Drawing,
     entity: DXFGraphic,
-    cells: list[str],
+    cells: list[list[tuple[str, str]]],
+    segment_widths: list[list[float]],
     cell_widths: list[float],
     box_height: float,
     text_height: float,
@@ -1315,17 +1479,19 @@ def _build_tolerance_block(
         - 文字方向（+X）：框从 ``0`` 到 ``total_width``（insert 是起点）。
         - 框高方向（+Y）：框在 ``y=0`` 两侧对称（``±box_height/2``），中线与引线对齐。
 
+    ``cells`` 每格是 ``(text, style_name)`` 片段列表（GDT 符号用 gdt 样式、普通文字用
+    cjk 样式），``segment_widths`` 对应每段宽度，用于片段整体居中排版。
+
     块内实体：
         - 矩形框四条边（LINE）
         - 单元格之间的分隔竖线（LINE）
-        - 每格居中文字（TEXT，使用内置中文字体样式）
+        - 每格居中文字（TEXT；每格可能含多个片段，从左到右排布、整体居中）
     最终由调用方以 ``x_axis_vector`` 的角度旋转 INSERT，实现水平/垂直框。
     """
     name = f"_cad2image_tol_{entity.dxf.handle}"
     if name in doc.blocks:
         return name
     block = doc.blocks.new(name)
-    cjk_style = _ensure_cjk_style(doc)
     total_width = sum(cell_widths)
     half_height = box_height / 2.0
 
@@ -1342,12 +1508,20 @@ def _build_tolerance_block(
         if i < len(cell_widths) - 1:
             block.add_line((x, -half_height), (x, half_height))
 
-    # 每格居中文字（中线在 y=0）
+    # 每格居中文字（中线在 y=0）；每格片段从左到右排布、整体居中。
     x = 0.0
-    for cell, width in zip(cells, cell_widths):
-        text = block.add_text(cell, dxfattribs={"style": cjk_style, "height": text_height})
-        text.set_placement((x + width / 2.0, 0.0), align=TextEntityAlignment.MIDDLE_CENTER)
-        x += width
+    for cell, seg_widths, cell_width in zip(cells, segment_widths, cell_widths):
+        content_width = sum(seg_widths)
+        seg_x = x + (cell_width - content_width) / 2.0
+        for (text, style_name), seg_width in zip(cell, seg_widths):
+            text_entity = block.add_text(
+                text, dxfattribs={"style": style_name, "height": text_height}
+            )
+            text_entity.set_placement(
+                (seg_x + seg_width / 2.0, 0.0), align=TextEntityAlignment.MIDDLE_CENTER
+            )
+            seg_x += seg_width
+        x += cell_width
 
     return name
 
@@ -1391,10 +1565,11 @@ def _decode_multibyte_text(doc: ezdxf.document.Drawing) -> None:
 
 
 def _remap_missing_glyphs(doc: ezdxf.document.Drawing) -> None:
-    """把内置字体缺少字形的符号替换为视觉等价的有字形符号。
+    """把内置字体缺少字形、或字形宽度异常的符号替换为视觉等价的有字形符号。
 
-    思源宋体缺少直径符号 U+2300（渲染成 .notdef 方框），用有字形的 U+00D8 替代，
-    保证直径符号可见。映射表见模块级 ``_GLYPH_FALLBACKS``。
+    思源宋体缺少直径符号 U+2300（渲染成 .notdef 方框），且 U+2205（∅）虽存在但是全宽
+    字形、会让尺寸标注文字比 CAD 原图窄字体宽出 6%~43%。二者都替换为宽度更接近的
+    U+00D8（Ø）。映射表见模块级 ``_GLYPH_FALLBACKS``。
     """
     for entity in _iter_text_entities(doc):
         raw = entity.dxf.get("text", "")
@@ -1479,6 +1654,94 @@ def _select_layout(doc: ezdxf.document.Drawing, layout_name: str | None) -> Layo
     except KeyError as exc:
         available = [layout.name for layout in doc.layouts]
         raise ValueError(f"布局 '{layout_name}' 不存在，可用布局：{available}") from exc
+
+
+def _content_size_mm(
+    options: RenderOptions,
+    content_bbox: BoundingBox2d | None,
+    embedded_images: list[_EmbeddedImage],
+) -> tuple[float, float] | None:
+    """确定用于像素估算的内容尺寸（宽 mm, 高 mm），无法确定时返回 ``None``。
+
+    显式 ``width_mm/height_mm`` 优先，否则用实际渲染内容包围盒（``content_bbox``）并入
+    嵌入图片包围盒。
+    """
+    if options.width_mm is not None and options.height_mm is not None:
+        return float(options.width_mm), float(options.height_mm)
+    box = BoundingBox2d()
+    if content_bbox is not None and content_bbox.has_data:
+        box.extend(content_bbox)
+    for image in embedded_images:
+        box.extend((image.corner_min, image.corner_max))
+    if not box.has_data:
+        return None
+    return float(box.size.x), float(box.size.y)
+
+
+def _clamp_dpi(
+    dpi: int,
+    content_bbox: BoundingBox2d | None,
+    embedded_images: list[_EmbeddedImage],
+    options: RenderOptions,
+) -> int:
+    """按输出像素总量上限钳制 dpi，防止超大页面光栅化时 OOM。
+
+    部分图纸把嵌入图片（OLE2FRAME）放大到十几米的物理尺寸，默认 ``dpi=300`` 光栅化会产出
+    几十 GB 内存的 pixmap，进程被系统 OOM 杀死（报 ``BrokenProcessPool``）。这里在渲染前
+    估算最终页面的像素量（尺寸由 :func:`_content_size_mm` 确定：显式 ``width_mm/height_mm``
+    优先，否则用实际渲染内容包围盒 ``player.bbox()`` 并入嵌入图片包围盒）。超过
+    ``_MAX_OUTPUT_PIXELS`` 时按比例下调 dpi，只对超大页面生效。
+
+    Args:
+        dpi: 用户请求的 DPI。
+        content_bbox: 实际渲染内容包围盒（``player.bbox()``）。
+        embedded_images: 嵌入图片列表（其包围盒在超大页面场景下主导像素量）。
+        options: 渲染参数（读取显式页面尺寸）。
+
+    Returns:
+        调整后的 DPI（不超过请求值）。
+    """
+    size = _content_size_mm(options, content_bbox, embedded_images)
+    if size is None:
+        return dpi
+    width_mm, height_mm = size
+    mm_per_inch = 25.4
+    pixels = (width_mm * dpi / mm_per_inch) * (height_mm * dpi / mm_per_inch)
+    if pixels <= _MAX_OUTPUT_PIXELS:
+        return dpi
+    # 像素量与 dpi 的平方成正比，按比例下调 dpi 使像素量刚好落在上限内。
+    scale = math.sqrt(_MAX_OUTPUT_PIXELS / pixels)
+    return max(int(dpi * scale), 1)
+
+
+def _resolve_dpi(
+    options: RenderOptions,
+    content_bbox: BoundingBox2d | None,
+    embedded_images: list[_EmbeddedImage],
+) -> int:
+    """计算实际渲染 DPI：``--resolution``（目标长边像素，优先）或 ``--dpi``，再受上限钳制。
+
+    ``--resolution`` 语义：输出图长边固定为指定像素，内部按内容长边换算
+    ``dpi = 长边像素 × 25.4 / 内容长边(mm)``，使图大图小输出清晰度一致；未指定
+    ``--resolution`` 时退回固定 ``--dpi``。换算结果仍过 :func:`_clamp_dpi` 的像素上限
+    保护，防止超大页面 OOM。
+
+    Args:
+        options: 渲染参数（读取 ``resolution`` / ``dpi`` 与显式页面尺寸）。
+        content_bbox: 实际渲染内容包围盒（``player.bbox()``）。
+        embedded_images: 嵌入图片列表。
+
+    Returns:
+        最终渲染 DPI。
+    """
+    dpi = options.dpi
+    if options.resolution is not None:
+        size = _content_size_mm(options, content_bbox, embedded_images)
+        if size is not None:
+            max_dim_mm = max(size)
+            if max_dim_mm > 0:
+                dpi = max(int(options.resolution * 25.4 / max_dim_mm), 1)
+    return _clamp_dpi(dpi, content_bbox, embedded_images, options)
 
 
 def _determine_page(

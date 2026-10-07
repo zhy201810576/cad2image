@@ -65,6 +65,9 @@ cad2image 图.dwg -o 图.png --ctb 黑白线型.ctb
 # 按内容自适应页面，四周留 5% 余量
 cad2image 图.dxf -o 图.png --fit --margin 5.0
 
+# 目标分辨率（长边像素），图大图小输出清晰度一致（小图不再模糊）
+cad2image 图.dwg -o 图.png --resolution 2k
+
 # 单色 / 灰度输出
 cad2image 图.dwg -o 图.png --color monochrome
 cad2image 图.dwg -o 图.png --color grayscale
@@ -79,6 +82,7 @@ cad2image 图.dwg -o 图.png --width 420 --height 297
 |---|---|---|
 | `--output, -o` | 输出文件/目录 | 与输入同目录 |
 | `--dpi` | PNG 分辨率 | 300 |
+| `--resolution` | 目标分辨率（长边像素）：`1k`/`2k`/`3k`/`4k` 或正整数；优先于 `--dpi` | 无（用 `--dpi`） |
 | `--format, -f` | 输出格式 `png` / `svg` | png |
 | `--background` | `default` / `white` / `black` / `off` | white |
 | `--color` | `color` / `monochrome` / `grayscale` / `black` / `white` | color |
@@ -102,7 +106,7 @@ cad2image 图.dwg -o 图.png --width 420 --height 297
 
 | Acme 参数 | 本工具映射 |
 |---|---|
-| `/res N` | `--dpi N` |
+| `/res N` | `--dpi N`（或 `--resolution 2k` 等目标分辨率） |
 | `/w` `/h`（mm） | `--width` / `--height` |
 | `/e` `/ad`（缩放扩展） | `--fit`（包围盒自适应） |
 | `/b` 背景色 | `--background` |
@@ -180,6 +184,7 @@ render_dxf("图.dxf", "图.png", RenderOptions(ctb="黑白线型.ctb"))
 ```python
 RenderOptions(
     dpi=300,                          # PNG 分辨率
+    resolution=None,                  # 目标分辨率（长边像素），None=用 dpi
     background="white",               # default/white/black/off
     color_policy="color",             # color/monochrome/grayscale/black/white
     lineweight_policy="absolute",     # absolute/relative

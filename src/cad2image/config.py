@@ -26,6 +26,42 @@ _BACKGROUND_CHOICES = {"default", "white", "black", "off", "none"}
 _COLOR_POLICY_CHOICES = {"color", "monochrome", "grayscale", "black", "white"}
 _LINEWEIGHT_POLICY_CHOICES = {"absolute", "relative"}
 
+# ``--resolution`` 的预设短名 → 目标长边像素。目标分辨率语义：输出图长边固定为指定像素，
+# 图大图小输出清晰度一致（内部按内容长边换算 dpi），与固定 ``--dpi`` 的"图小则像素少"
+# 不同。短名对齐常见生图工具的 1K/2K/4K 口径（长边像素）。
+_RESOLUTION_PRESETS = {"1k": 1024, "2k": 2048, "3k": 3072, "4k": 4096}
+
+
+def parse_resolution(value: str | None) -> int | None:
+    """把 ``--resolution`` 参数解析为长边像素数，``None`` 表示未指定（用 ``--dpi``）。
+
+    支持预设短名（``1k``/``2k``/``3k``/``4k``，大小写不敏感）或纯数字（自定义长边
+    像素）。非法取值抛出 ``ValueError``。
+
+    Args:
+        value: 命令行 ``--resolution`` 原始字符串，``None`` 表示未传。
+
+    Returns:
+        长边像素数；未指定时返回 ``None``。
+
+    Raises:
+        ValueError: 取值既非预设短名也非正整数时。
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _RESOLUTION_PRESETS:
+        return _RESOLUTION_PRESETS[normalized]
+    try:
+        pixels = int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"非法的 --resolution 取值 '{value}'，可选 1k/2k/3k/4k 或正整数像素"
+        ) from exc
+    if pixels <= 0:
+        raise ValueError(f"--resolution 必须为正整数，得到 {value}")
+    return pixels
+
 
 def get_oda_converter_path() -> Path:
     """返回 ODA File Converter 可执行文件的路径。
@@ -47,6 +83,8 @@ class RenderOptions:
 
     Attributes:
         dpi: 输出分辨率（PNG）。默认 300。
+        resolution: 目标分辨率（长边像素），``None`` 表示用 ``dpi``。指定后优先于
+            ``dpi``，图大图小输出长边固定为该像素数。
         background: 背景策略，``default/white/black/off``。默认 ``white``。
         color_policy: 颜色策略，``color/monochrome/grayscale/black/white``。默认 ``color``。
         lineweight_policy: 线宽策略，``absolute/relative``。默认 ``absolute``。
@@ -61,9 +99,11 @@ class RenderOptions:
         height_mm: 显式页面高度（mm），``None`` 表示按布局/范围自适应。
         fit_to_extents: 是否按模型空间内容范围自适应页面尺寸。默认 ``False``。
         margin: 内容范围自适应时的四周余量，按内容较小边的百分比（0–100）。默认 3.0。
+        text_scale: 全局文字缩放系数，乘到所有文字实体的高度上（用于整体调大/调小文字）。默认 1.0。
     """
 
     dpi: int = 300
+    resolution: int | None = None
     background: str = "white"
     color_policy: str = "color"
     lineweight_policy: str = "absolute"
@@ -78,6 +118,7 @@ class RenderOptions:
     height_mm: float | None = None
     fit_to_extents: bool = False
     margin: float = 3.0
+    text_scale: float = 1.0
 
 
 def build_drawing_configuration(options: RenderOptions) -> draw_config.Configuration:
@@ -96,6 +137,8 @@ def build_drawing_configuration(options: RenderOptions) -> draw_config.Configura
     """
     if options.dpi <= 0:
         raise ValueError(f"DPI 必须为正整数，得到 {options.dpi}")
+    if options.resolution is not None and options.resolution <= 0:
+        raise ValueError(f"目标分辨率必须为正整数，得到 {options.resolution}")
     if options.lineweight_scaling <= 0:
         raise ValueError(f"线宽缩放系数必须为正数，得到 {options.lineweight_scaling}")
     if options.min_lineweight is not None and options.min_lineweight <= 0:
@@ -106,6 +149,8 @@ def build_drawing_configuration(options: RenderOptions) -> draw_config.Configura
         raise ValueError(f"相对线宽最细比例必须为正数，得到 {options.relative_min_stroke_width}")
     if options.margin < 0:
         raise ValueError(f"页面余量百分比必须为非负数，得到 {options.margin}")
+    if options.text_scale <= 0:
+        raise ValueError(f"文字缩放系数必须为正数，得到 {options.text_scale}")
 
     background = _map_background_policy(options.background)
     color_policy = _map_color_policy(options.color_policy)
