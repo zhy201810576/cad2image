@@ -39,3 +39,7 @@ ODAFileConverter_v21.5.0/
 
 # 黑白线型 CTB（本地测试打印样式表，不入库）
 黑白线型.ctb
+
+# 根目录诊断图纸与用户字体目录（不入库；内置字体在 src/cad2image/fonts/）
+/CAD问题图纸/
+/fonts/
