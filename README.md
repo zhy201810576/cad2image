@@ -89,6 +89,7 @@ cad2image 图.dwg -o 图.png --width 420 --height 297
 | `--lineweight` | `absolute` / `relative` | absolute |
 | `--lineweight-scaling` | 线宽整体缩放系数（仅绝对线宽生效） | 1.0 |
 | `--min-lineweight` | 最小打印线宽（mm） | 无 |
+| `--auto-lineweight-scaling` | 按内容尺寸自动缩放绝对线宽（使 0.3mm 线恒等 2px，覆盖 `--lineweight-scaling`） | False |
 | `--relative-max-stroke-width` | 相对线宽：最粗线宽占页面较小边比例 | 0.001（0.1%） |
 | `--relative-min-stroke-width` | 相对线宽：最细线宽占最粗线宽比例 | 0.05（5%） |
 | `--ctb` | CTB 打印样式表路径 | 无 |
@@ -101,6 +102,22 @@ cad2image 图.dwg -o 图.png --width 420 --height 297
 | `--oda-path` | ODA 可执行文件路径 | 环境变量/默认路径 |
 
 退出码：`0` 成功；`1` 转换或渲染失败（批量时存在任一失败即非零）。
+
+## 线宽控制
+
+`--resolution` 固定输出长边像素，图越大每毫米对应的像素越少——绝对线宽（固定 mm）在大图下
+（如 3.6m 零件）0.3mm 不足 1 像素，粗细不可见；小图又会被放大得过粗。三种策略应对不同场景：
+
+| 策略 | 参数 | 特点 |
+|---|---|---|
+| 绝对线宽（固定系数） | `--lineweight absolute --lineweight-scaling N` | 线宽 = 原始 mm × N，真实比例；但跨尺寸图纸会顾此失彼 |
+| 绝对线宽（自动缩放） | `--lineweight absolute --auto-lineweight-scaling` | 按内容尺寸反推系数，让 0.3mm 线恒等 2px，跨尺寸自适应且保留真实比例（**推荐**） |
+| 相对线宽 | `--lineweight relative --relative-max-stroke-width R` | 线宽按页面较小边比例缩放，图大图小自适应；但 0.05–2.11mm 上下限会压缩粗细对比 |
+
+```bash
+# 绝对线宽自动缩放：0.3mm 线在任意尺寸图纸上均显示约 2px
+cad2image 图.dwg -o 图.png --resolution 2k --auto-lineweight-scaling
+```
 
 ## 从 Acme CAD Converter 迁移
 
@@ -190,6 +207,7 @@ RenderOptions(
     lineweight_policy="absolute",     # absolute/relative
     lineweight_scaling=1.0,           # 线宽整体缩放（仅绝对线宽）
     min_lineweight=None,              # 最小打印线宽(mm)
+    auto_lineweight_scaling=False,    # 按内容尺寸自动缩放（使 0.3mm 恒等 2px）
     relative_max_stroke_width=0.001,  # 相对线宽最粗比例
     relative_min_stroke_width=0.05,   # 相对线宽最细比例
     ctb="",                           # CTB 样式表路径

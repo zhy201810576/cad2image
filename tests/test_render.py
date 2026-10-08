@@ -1358,3 +1358,145 @@ def test_resolve_dpi_clamps_oversized_resolution() -> None:
     bbox = BoundingBox2d([(0.0, 0.0), (16328.6, 10598.0)])
     dpi = _resolve_dpi(RenderOptions(dpi=300, resolution=4096), bbox, [])
     assert dpi <= 300
+
+
+def test_snap_leader_arrowheads_keeps_touching_tip() -> None:
+    """箭头尖端已贴住图形（前方 0.5 单位内即有交点）时不应移动。
+
+    回归：旧实现从「尖端外一个箭头大小」处起射、且退一个箭头大小，导致本就贴着特征的
+    箭头被误吸到更远处的无关线，整体位移（指示箭头错位.dwg 的坐标指示箭头）。
+    """
+    import ezdxf
+
+    from cad2image.render import _snap_leader_arrowheads
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    # 水平线 y=0；箭头尖端 (5,0) 正落在线上，指向 +y（背离线）。
+    msp.add_line((0, 0), (10, 0))
+    leader = msp.add_leader([(5, 0), (5, -10)])
+
+    _snap_leader_arrowheads(doc)
+
+    vertices = list(leader.vertices)
+    assert (vertices[0][0], vertices[0][1]) == (5, 0)
+
+
+def test_snap_leader_arrowheads_snaps_small_gap() -> None:
+    """箭头尖端与图形之间有小间隙（小于 1 个箭头大小）时，尖端应吸附到图形上。"""
+    import ezdxf
+
+    from cad2image.render import _snap_leader_arrowheads
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_line((0, 0), (10, 0))
+    # 尖端 (5,2) 距线 2 单位（默认 dimasz=2.5 内），指向 -y。
+    leader = msp.add_leader([(5, 2), (5, 12)])
+
+    _snap_leader_arrowheads(doc)
+
+    vertices = list(leader.vertices)
+    assert (vertices[0][0], vertices[0][1]) == pytest.approx((5, 0))
+
+
+def test_snap_leader_arrowheads_ignores_distant_graphic() -> None:
+    """箭头尖端距图形超过 1 个箭头大小时不动（可能指向文字/坐标点，非吸附目标）。"""
+    import ezdxf
+
+    from cad2image.render import _snap_leader_arrowheads
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_line((0, 0), (10, 0))
+    # 尖端 (5,10) 距线 10 单位，超出默认 dimasz=2.5。
+    leader = msp.add_leader([(5, 10), (5, 20)])
+
+    _snap_leader_arrowheads(doc)
+
+    vertices = list(leader.vertices)
+    assert (vertices[0][0], vertices[0][1]) == (5, 10)
+
+
+def test_remap_text_style_fonts_discards_extended_font_data() -> None:
+    """重映射字体时应清除扩展字体数据（XDATA family），否则 make_font 忽略重写。
+
+    回归：ODA 在文字样式 XDATA 里存 family（如 SimSun），``TextStyle.make_font``
+    优先读它而非 ``dxf.font``，导致重写后的内置字体被忽略、宽度估算回退到系统字体
+    （Windows=SimSun / Ubuntu=DejaVu），两平台估算宽度不同 → 折行结果不同。
+    """
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_text_style_fonts
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    style = doc.styles.get("Standard")
+    style.dxf.font = ""  # 空字体名 → 映射到内置中文字体
+    style.set_extended_font_data("SimSun")
+    assert style.has_extended_font_data is True
+
+    _remap_text_style_fonts(doc)
+
+    assert style.dxf.font == "SourceHanSerifSC-Regular.ttf"
+    assert style.has_extended_font_data is False
+    # make_font 应命中内置中文字体（而非 SimSun 系统字体）
+    assert style.make_font(2.5).glyph_cache.font_name == "Source Han Serif SC"
+
+
+def test_remap_cjk_text_width_wrap_sets_width_for_unconstrained() -> None:
+    """无框宽（width=0，CAD 里单行）的含中文 MTEXT 应显式写单行宽度。
+
+    回归：width=0 时 ezdxf 走 ``estimate_mtext_extents`` 估算框宽，该估算对含
+    ``\\W`` 内联码的中文偏小，把本应单行的文字误折成两行。这里应显式写入 width，
+    绕开不准确的估算（不新增 ``\\P`` 强制换行）。
+    """
+    import ezdxf
+
+    from cad2image.render import _configure_fonts, _remap_cjk_text_width_wrap
+
+    _configure_fonts("")
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_mtext("镀前螺纹", dxfattribs={"width": 0.0, "char_height": 2.5})
+
+    _remap_cjk_text_width_wrap(doc)
+
+    mtext = list(msp)[0]
+    assert mtext.dxf.get("width", 0.0) > 0.0
+    assert r"\P" not in mtext.text
+
+
+def test_apply_auto_lineweight_scaling_derives_from_content_size() -> None:
+    """自动缩放按内容长边反推 lineweight_scaling，使 0.3mm 恒等 2px。"""
+    import ezdxf
+
+    from cad2image.render import _apply_auto_lineweight_scaling
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_line((0, 0), (100, 50))  # 内容长边 100mm
+    options = RenderOptions(auto_lineweight_scaling=True, resolution=2048)
+    scaled = _apply_auto_lineweight_scaling(options, msp)
+    # px_per_mm = 2048 / 100 = 20.48；scaling = 2 / (0.3 * 20.48)
+    assert scaled.lineweight_scaling == pytest.approx(2.0 / (0.3 * 2048 / 100))
+
+
+def test_pixels_per_mm_dpi_mode() -> None:
+    """dpi 模式下每毫米像素数 = dpi / 25.4（与图纸尺寸无关）。"""
+    import ezdxf
+
+    from cad2image.render import _pixels_per_mm
+
+    doc = ezdxf.new("R2018")
+    assert _pixels_per_mm(RenderOptions(dpi=300), doc.modelspace()) == pytest.approx(300 / 25.4)
+
+
+def test_pixels_per_mm_empty_layout_returns_none() -> None:
+    """空布局在 resolution 模式下无法估算像素密度，返回 None。"""
+    import ezdxf
+
+    from cad2image.render import _pixels_per_mm
+
+    doc = ezdxf.new("R2018")
+    assert _pixels_per_mm(RenderOptions(resolution=2048), doc.modelspace()) is None

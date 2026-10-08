@@ -89,9 +89,12 @@ class RenderOptions:
         color_policy: 颜色策略，``color/monochrome/grayscale/black/white``。默认 ``color``。
         lineweight_policy: 线宽策略，``absolute/relative``。默认 ``absolute``。
         lineweight_scaling: 线宽整体缩放系数，乘到每条线的线宽上（仅绝对线宽策略生效）。默认 1.0。
-        min_lineweight: 最小打印线宽（mm），``None`` 表示不设下限。
+        min_lineweight: 最小打印线宽（mm），``None`` 表示不设下限。内部会换算为 ezdxf 要求的 1/300 英寸单位。
         relative_max_stroke_width: 相对线宽策略下，最粗线宽（2.11mm）占页面较小边的比例。默认 0.001（0.1%）。
         relative_min_stroke_width: 相对线宽策略下，最细线宽（0.05mm）占最粗线宽的比例。默认 0.05（5%）。
+        auto_lineweight_scaling: 是否按内容尺寸自动推导 ``lineweight_scaling``，使锚定线宽
+            （0.3mm）在输出图上恒等于 2px（仅绝对线宽策略生效，开启后覆盖 ``lineweight_scaling``）。
+            默认 ``False``。
         ctb: CTB 打印样式表路径，``""`` 表示不使用。
         font_dir: 附加的 SHX/TTF 字体目录，``""`` 表示仅用系统字体。
         layout_name: 要渲染的布局名，``None`` 表示模型空间。默认 ``None``。
@@ -111,6 +114,7 @@ class RenderOptions:
     min_lineweight: float | None = None
     relative_max_stroke_width: float = 0.001
     relative_min_stroke_width: float = 0.05
+    auto_lineweight_scaling: bool = False
     ctb: str = ""
     font_dir: str = ""
     layout_name: str | None = None
@@ -156,12 +160,21 @@ def build_drawing_configuration(options: RenderOptions) -> draw_config.Configura
     color_policy = _map_color_policy(options.color_policy)
     lineweight_policy = _map_lineweight_policy(options.lineweight_policy)
 
+    # ezdxf 的 ``Configuration.min_lineweight`` 单位是 1/300 英寸（非 mm），若把用户按 mm
+    # 理解的数值直接透传，会被后端 ``resolve_stroke_width`` 按 1/300 英寸误读并钳到
+    # 0.05mm 下限，导致该参数静默失效。这里把对外的 mm 语义换算为 1/300 英寸。
+    min_lineweight = (
+        options.min_lineweight * 300.0 / 25.4
+        if options.min_lineweight is not None
+        else None
+    )
+
     return draw_config.Configuration(
         background_policy=background,
         color_policy=color_policy,
         lineweight_policy=lineweight_policy,
         lineweight_scaling=options.lineweight_scaling,
-        min_lineweight=options.min_lineweight,
+        min_lineweight=min_lineweight,
     )
 
 

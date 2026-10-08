@@ -13,6 +13,7 @@ import math
 import re
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple
 
@@ -289,6 +290,8 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_tolerance_to_graphics(doc, options.font_dir)
     _scale_text_heights(doc, options.text_scale)
     dxf_layout = _select_layout(doc, options.layout_name)
+    if options.auto_lineweight_scaling:
+        options = _apply_auto_lineweight_scaling(options, dxf_layout)
     drawing_config = build_drawing_configuration(options)
     embedded_images = _extract_ole_images(dxf_layout)
 
@@ -347,6 +350,8 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_tolerance_to_graphics(doc, options.font_dir)
     _scale_text_heights(doc, options.text_scale)
     dxf_layout = _select_layout(doc, options.layout_name)
+    if options.auto_lineweight_scaling:
+        options = _apply_auto_lineweight_scaling(options, dxf_layout)
     drawing_config = build_drawing_configuration(options)
 
     context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
@@ -494,6 +499,16 @@ def _remap_text_style_fonts(doc: ezdxf.document.Drawing) -> None:
         mapped = _map_font_name(style.dxf.font)
         if mapped != style.dxf.font:
             style.dxf.font = mapped
+        # 清除扩展字体数据（XDATA "ACAD" 里的 family 名）：ezdxf 的
+        # ``TextStyle.make_font()``（被 ``estimate_mtext_extents`` 用于 width=0.0
+        # MTEXT 的宽度估算）优先读取扩展字体数据而非 ``dxf.font``，若不清理，
+        # 上面重写的字体名会被忽略、回退到 family（如 SimSun / 未安装时 DejaVu），
+        # 导致两平台宽度估算不一致、折行结果不同。而实际文字排版走
+        # ``RenderContext.add_text_style``（dxf.font 非空即优先用它），两者路径
+        # 不一致正是「Windows 不换行、Ubuntu 换行」的根因。清掉后统一落到重写的
+        # 内置字体名。
+        if style.has_extended_font_data:
+            style.discard_extended_font_data()  # type: ignore[no-untyped-call]
 
 
 def _ensure_cjk_style(doc: ezdxf.document.Drawing) -> str:
@@ -675,11 +690,15 @@ _WRAP_OVERFLOW_TOLERANCE = 1.30
 
 
 def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
-    """对含中文、框宽>0 且超宽的 MTEXT 按框宽折行，插入 ``\\P`` 强制换行。
+    """对齐含中文 MTEXT 的折行：超宽者按框宽折行，无框宽者显式写单行宽度。
 
     ezdxf 的 MTEXT 自动换行只按空格/单词边界折行，不拆分无空格的中文长串；当 CAD 里中文
     靠 MTEXT 框宽（width）自动折行时，ezdxf 会单行溢出（变一行）。这里在渲染前按框宽逐字
     折行（CJK 逐字、西文连续段整体），插入 ``\\P`` 对齐 CAD 的折行效果。
+
+    无框宽约束（width=0，CAD 里单行）的 MTEXT：ezdxf 走 ``estimate_mtext_extents`` 估算
+    框宽，该估算对含 ``\\W`` 内联码的中文偏小，会把本应单行的文字误折成两行。这里按内置
+    中文字体量出单行宽度后显式写入 width，绕开估算（见函数体 width<=0 分支）。
 
     只处理**纯文本**（无内联格式码、无已有换行）的 MTEXT；宽度按
     :func:`_remap_cjk_text_width` 施加的 0.734 宽度因子折算（框宽除以 0.734 换回未压窄的
@@ -694,9 +713,6 @@ def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
         raw = entity.dxf.get("text", "")
         if not raw or not _contains_cjk(raw):
             continue
-        width = entity.dxf.get("width", 0.0)
-        if width <= 0:
-            continue
         char_height = entity.dxf.get("char_height", 2.5)
 
         # 剥离开头的宽度因子前缀（\W0.734;），折行后再拼回。
@@ -709,11 +725,20 @@ def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
         if _MTEXT_FORMAT_RE.search(raw) or "\\P" in raw:
             continue
 
-        # 压窄后框宽换算回未压窄的测量宽度（0.734 宽度因子）。
-        max_width = width / _CJK_WIDTH_FACTOR
-
         def measure(text: str, _ch: float = char_height) -> float:
             return renderer.get_text_line_width(text, font_face, _ch)
+
+        width = entity.dxf.get("width", 0.0)
+        if width <= 0:
+            # 无框宽约束（CAD 里单行，width 组码 41 为 0）：ezdxf 会走
+            # ``estimate_mtext_extents`` 估算框宽，而它对含 ``\W`` 内联码的中文估算偏小，
+            # 导致本应单行的文字被误折成两行。这里按内置中文字体量出单行宽度后显式写入
+            # width，绕开不准确的估算，保证单行不折（加 1% 余量防浮点误差）。
+            entity.dxf.width = measure(raw) * _CJK_WIDTH_FACTOR * 1.01
+            continue
+
+        # 压窄后框宽换算回未压窄的测量宽度（0.734 宽度因子）。
+        max_width = width / _CJK_WIDTH_FACTOR
 
         # 加溢出容差，避免「无框宽约束、文字恰好占满宽度」的 MTEXT 被浮点误差误折行。
         if measure(raw) <= max_width * _WRAP_OVERFLOW_TOLERANCE:
@@ -725,6 +750,10 @@ def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
 
 
 _LEADER_GRAPHICS_TYPES = {"LINE", "ARC", "CIRCLE", "LWPOLYLINE"}
+
+# 判定 LEADER 箭头尖端是否「已贴住图形」的距离阈值（图纸单位）：尖端前方小于该距离即
+# 视为已吸附到位，不再移动，避免把指向文字/坐标点的箭头误吸到更远处的无关图形。
+_LEADER_TOUCH_EPSILON = 0.5
 
 
 def _iter_leaders(doc: ezdxf.document.Drawing) -> Iterator[Leader]:
@@ -800,13 +829,19 @@ def _ray_intersect_graphic(
 
 
 def _snap_leader_arrowheads(doc: ezdxf.document.Drawing) -> None:
-    """把 LEADER 箭头尖端吸附到最近的图形轮廓，消除箭头悬空留下的空白。
+    """把 LEADER 箭头尖端吸附到紧邻的图形轮廓，闭合 ODA 转换引入的微小悬空。
 
-    ODA File Converter 转 DXF 时，LEADER 的特征端顶点（``vertices[0]``）常没精确落在
-    被标注的图形轮廓上，导致箭头尖端与图形之间留出几单位的空白（视觉上像线断了）。
-    这里对每条 LEADER：沿箭头指向方向发射射线探测最近的图形（LINE/ARC/CIRCLE/
-    LWPOLYLINE），若在约 3 倍箭头大小的范围内命中图形，就把 ``vertices[0]`` 沿方向挪到
-    使箭头尖端恰好落在图形上。只沿箭头方向探测，避免误吸到侧向的其它线。
+    ODA File Converter 转 DXF 时，LEADER 的特征端顶点（``vertices[0]``，即箭头尖端）
+    偶尔没精确落在被标注的图形轮廓上，留下几单位的空白。这里对每条 LEADER：从箭头尖端
+    沿指向方向发射射线，若前方约 1 个箭头大小的范围内命中图形，就把尖端直接挪到图形上。
+
+    两个关键约束（防误吸、防位移）：
+
+    - 只探测尖端前方一小段（1 倍箭头大小），且**尖端已贴住图形（前方
+      ``_LEADER_TOUCH_EPSILON`` 单位内即有交点）则不动**——避免把指向文字/坐标点、本就
+      贴着图形的箭头误吸到更远处的无关线（这是箭头整体位移的根源）。
+    - 箭头尖端即 ``vertices[0]``（ezdxf 渲染 LEADER 时以它为 ``insert``、箭尖在块原点），
+      故直接 ``vertices[0] = 交点``，不再像旧实现那样沿方向多退一个箭头大小。
     """
     graphics: list[DXFGraphic] = []
     for layout in doc.layouts:
@@ -826,9 +861,9 @@ def _snap_leader_arrowheads(doc: ezdxf.document.Drawing) -> None:
             continue
         direction = direction / length
         size = _leader_arrow_size(doc, entity)
-        tip = Vec2(v0.x, v0.y) + Vec2(direction.x, direction.y) * size
+        tip = Vec2(v0.x, v0.y)
         dir2 = Vec2(direction.x, direction.y)
-        ray_len = size * 3.0
+        ray_len = size
 
         best: Vec2 | None = None
         best_d = float("inf")
@@ -836,12 +871,12 @@ def _snap_leader_arrowheads(doc: ezdxf.document.Drawing) -> None:
             hit = _ray_intersect_graphic(tip, dir2, ray_len, graphic)
             if hit is not None:
                 d = (hit - tip).magnitude
-                if 0.0 < d < best_d:
+                if d < best_d:
                     best_d, best = d, hit
 
-        if best is not None and best_d <= ray_len:
-            new_v0 = Vec3(best.x - dir2.x * size, best.y - dir2.y * size, v0.z)
-            entity.set_vertices([new_v0] + vertices[1:])
+        # 尖端已贴住图形（前方 _LEADER_TOUCH_EPSILON 内即有交点）→ 不动；否则直接挪到图形上。
+        if best is not None and _LEADER_TOUCH_EPSILON <= best_d <= ray_len:
+            entity.set_vertices([Vec3(best.x, best.y, v0.z)] + vertices[1:])
 
 
 def _looks_like_image(data: bytes) -> bool:
@@ -1080,7 +1115,7 @@ def _remap_wide_polyline_to_graphics(doc: ezdxf.document.Drawing) -> None:
     targets: list[tuple[BlockLayout, LWPolyline]] = []
     for block in doc.blocks:
         for entity in block:
-            if entity.dxftype() == "LWPOLYLINE" and entity.has_width:
+            if isinstance(entity, LWPolyline) and entity.has_width:
                 targets.append((block, entity))
 
     for block, entity in targets:
@@ -1396,7 +1431,7 @@ def _remap_tolerance_to_graphics(doc: ezdxf.document.Drawing, font_dir: str = ""
             widths = [
                 renderer.get_text_line_width(
                     text,
-                    gdt_face if (gdt_style_name and style == gdt_style_name) else cjk_face,
+                    gdt_face if (gdt_style_name and style == gdt_style_name) else cjk_face,  # type: ignore[arg-type]
                     text_height,
                 )
                 for text, style in cell
@@ -1634,6 +1669,47 @@ def _build_render_settings(options: RenderOptions) -> layout_module.Settings:
         max_stroke_width=options.relative_max_stroke_width,
         min_stroke_width=options.relative_min_stroke_width,
     )
+
+
+# 绝对线宽自动缩放的锚定值：令 0.3mm 线宽在输出图上恒等于 2px。
+_AUTO_LW_REFERENCE_MM = 0.3
+_AUTO_LW_REFERENCE_PX = 2.0
+
+
+def _pixels_per_mm(options: RenderOptions, dxf_layout: Layout) -> float | None:
+    """估算输出图每毫米对应的像素数，无法估算时返回 ``None``。
+
+    ``--resolution`` 模式下 ``px_per_mm = resolution / 内容长边(mm)``；``--dpi`` 模式下
+    ``px_per_mm = dpi / 25.4``。内容长边用 ``bbox.extents`` 近似（与渲染用的
+    ``player.bbox()`` 只差 invisible 实体的贡献，对线宽缩放可忽略）。
+    """
+    if options.resolution is not None:
+        if options.width_mm is not None and options.height_mm is not None:
+            max_dim_mm = max(options.width_mm, options.height_mm)
+        else:
+            extents = bbox.extents(dxf_layout, fast=True)
+            if not extents.has_data:
+                return None
+            max_dim_mm = max(float(extents.size.x), float(extents.size.y))
+        if max_dim_mm <= 0:
+            return None
+        return options.resolution / max_dim_mm
+    return options.dpi / 25.4
+
+
+def _apply_auto_lineweight_scaling(options: RenderOptions, dxf_layout: Layout) -> RenderOptions:
+    """按内容尺寸自动推导 ``lineweight_scaling``（绝对线宽策略），让锚定线宽在屏幕上恒等固定像素。
+
+    绝对线宽下屏幕线宽 ``px = 线宽mm × scaling × px_per_mm``。令锚定线宽
+    （``_AUTO_LW_REFERENCE_MM``=0.3mm）恒等于 ``_AUTO_LW_REFERENCE_PX``（2px），
+    反解 ``scaling = target_px / (ref_mm × px_per_mm)``。这样大图（低 px_per_mm）自动放大、
+    小图（高 px_per_mm）自动缩小，保持绝对线宽的真实相对比例，同时跨尺寸自适应。
+    """
+    px_per_mm = _pixels_per_mm(options, dxf_layout)
+    if px_per_mm is None or px_per_mm <= 0:
+        return options
+    scaling = _AUTO_LW_REFERENCE_PX / (_AUTO_LW_REFERENCE_MM * px_per_mm)
+    return replace(options, lineweight_scaling=scaling)
 
 
 def _normalize_svg_encoding(svg_string: str) -> str:

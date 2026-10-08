@@ -68,9 +68,15 @@ def test_invalid_min_lineweight_raises() -> None:
 
 
 def test_min_lineweight_maps_to_config() -> None:
-    """最小线宽正确映射到 Configuration。"""
+    """最小线宽按对外 mm 语义换算为 ezdxf 的 1/300 英寸单位。"""
     config = build_drawing_configuration(RenderOptions(min_lineweight=0.2))
-    assert config.min_lineweight == pytest.approx(0.2)
+    assert config.min_lineweight == pytest.approx(0.2 * 300.0 / 25.4)
+
+
+def test_min_lineweight_none_passthrough() -> None:
+    """未设最小线宽时透传 None。"""
+    config = build_drawing_configuration(RenderOptions(min_lineweight=None))
+    assert config.min_lineweight is None
 
 
 def test_invalid_relative_max_stroke_width_raises() -> None:
