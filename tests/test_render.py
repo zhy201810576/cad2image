@@ -442,6 +442,34 @@ def test_remap_dimension_geometry_texts() -> None:
     assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
+def test_remap_dimension_tolerance_stack_to_mono_font() -> None:
+    """带 \\S 公差堆叠的 DIMENSION 几何块 MTEXT 应重指到等宽字体，避免公差换行。
+
+    回归：思源宋体（SourceHanSerifSC）的 TrueType 度量会让 ezdxf 把公差分数
+    （``\\S+0.02^  0``）拆成两行、下偏差丢失；等宽 NotoSansMono 渲染正常。
+    """
+    import ezdxf
+
+    from cad2image.render import _OPEN_MONO_FONT, _remap_dimension_geometry_texts
+
+    doc = ezdxf.new("R2018")
+    msp = doc.modelspace()
+    msp.add_linear_dim(base=(0, 0), p1=(0, 0), p2=(20, 0), angle=0)
+    dim = list(msp.query("DIMENSION"))[0]
+    dim.dxf.text = r"{\Fdim|c0;%%C}143.95{\H0.7x;\S+0.02^  0;}"
+    dim.render()
+    block = dim.get_geometry_block()
+    assert block is not None
+
+    _remap_dimension_geometry_texts(doc)
+
+    for entity in block:
+        if entity.dxftype() == "MTEXT" and "\\S" in entity.dxf.get("text", ""):
+            style = doc.styles.get(entity.dxf.get("style"))
+            assert style is not None
+            assert style.dxf.get("font") == _OPEN_MONO_FONT, style.dxf.get("font")
+
+
 def test_remap_dimension_properties() -> None:
     """DIMENSION 几何块子实体的 ByBlock 颜色/线宽应改为标注实体自身的值。
 
@@ -950,6 +978,32 @@ def test_remap_cjk_text_width_text_factor() -> None:
     texts = list(msp)
     assert abs(texts[0].dxf.width - 0.734) < 1e-6, texts[0].dxf.width
     assert texts[1].dxf.width == 1.0, texts[1].dxf.width
+
+
+def test_remap_cjk_text_width_skips_custom_width_factor() -> None:
+    r"""样式已带自定义宽度因子（≠1.0）时，不应再用 ``\W0.734`` 覆盖。
+
+    回归：CAD 里样式宽度因子（如 0.707）是作者按字体自然宽度调好的；内联 ``\W`` 会覆盖
+    样式因子，若 0.734 > 0.707 会令文字变宽——在 width=0 的 MTEXT 里，框宽按样式因子估算
+    （``estimate_mtext_extents`` 用 ``style.make_font``）而实际排版按 ``\W0.734``，两者不一致
+    会把本应单行或已有 ``\P`` 手动换行的文字误折行。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_cjk_text_width
+
+    doc = ezdxf.new("R2018")
+    doc.styles.add("CUSTOM", font="simsun.ttf", dxfattribs={"width": 0.707})
+    msp = doc.modelspace()
+    msp.add_mtext("安装9-ST5×0.8-5H EQS \\PGJB119.3A-2001钢丝螺套", dxfattribs={"style": "CUSTOM"})
+    msp.add_mtext("螺纹收尾")
+
+    _remap_cjk_text_width(doc)
+
+    texts = list(msp)
+    assert "\\W0.734;" not in texts[0].text, texts[0].text
+    assert texts[0].text.startswith("安装9-ST5"), texts[0].text
+    assert texts[1].text.startswith("\\W0.734;"), texts[1].text
 
 
 def test_looks_like_image_formats() -> None:

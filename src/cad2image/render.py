@@ -531,6 +531,22 @@ def _contains_cjk(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
 
+def _ensure_mono_style(doc: ezdxf.document.Drawing) -> str:
+    """返回一个指向内置等宽字体的样式名，不存在则创建。
+
+    用于把 DIMENSION 几何块里带 ``\\S`` 公差堆叠的纯西文文字重指到等宽字体：内置
+    思源宋体（SourceHanSerifSC）的 TrueType 度量会让 ezdxf 把公差分数（fraction）
+    渲染错位——上下偏差被拆成两行、下偏差丢失。等宽 NotoSansMono 渲染正常，且
+    ``\\S`` 公差堆叠的上下偏差恒为数字/符号（无 CJK），落到等宽字体不会方框。
+    """
+    for style in doc.styles:
+        if style.dxf.get("font", "") == _OPEN_MONO_FONT:
+            return str(style.dxf.name)
+    name = "_cad2image_mono"
+    doc.styles.add(name, font=_OPEN_MONO_FONT)
+    return name
+
+
 def _remap_cjk_text_styles(doc: ezdxf.document.Drawing) -> None:
     """把含中文但样式字体非中文字体的文字实体，重指到内置中文字体样式。
 
@@ -585,6 +601,24 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
             entity.dxf.text = new
 
 
+def _entity_width_factor(entity: DXFGraphic, doc: ezdxf.document.Drawing) -> float:
+    """返回文字实体的有效宽度因子，1.0 表示无自定义宽度因子。
+
+    MTEXT 的宽度因子来自样式（其组码 41 是框宽、不是宽度因子，内联 ``\\W`` 由调用方
+    单独判断）；TEXT/ATTRIB/ATTDEF 的宽度因子优先取实体 ``dxf.width``，为默认值 1.0 时
+    回退到样式。用于判断 0.734 的 SHX 补偿是否应跳过（已有自定义宽度因子时不应覆盖）。
+    """
+    style_name = entity.dxf.get("style", "") or "Standard"
+    style = doc.styles.get(style_name)
+    style_width = float(style.dxf.get("width", 1.0)) if style is not None else 1.0
+    if entity.dxftype() == "MTEXT":
+        return style_width
+    entity_width = float(entity.dxf.get("width", 1.0))
+    if not math.isclose(entity_width, 1.0):
+        return entity_width
+    return style_width
+
+
 def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
     """把含中文的文字实体宽度因子设为 0.734，压窄回 SHX 大字体宽度。
 
@@ -595,12 +629,19 @@ def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
 
     只处理**含中文**的文字：纯西文（尺寸数字、序号等）宽度因子保持 1.0 不受影响。同一段
     含中文的文字里的西文/数字也会被压窄约 26%，属于可接受的权衡。
+
+    跳过**已带自定义宽度因子**（≠1.0，如 CAD 里样式宽 0.707）的文字：内联 ``\\W`` 会覆盖
+    样式宽度因子，若 0.734 > 原因子会令文字变宽——在 width=0 的 MTEXT 里，框宽按样式因子
+    估算（``estimate_mtext_extents`` 用 ``style.make_font``），而实际排版按内联 ``\\W0.734``，
+    两者不一致会把本应单行或已有手动换行（``\\P``）的文字误折行。
     """
     factor = f"{_CJK_WIDTH_FACTOR}"
     for entity in _iter_text_entities(doc):
         raw = entity.dxf.get("text", "")
         if not raw or not _contains_cjk(raw):
             continue
+        if not math.isclose(_entity_width_factor(entity, doc), 1.0):
+            continue  # 已有自定义宽度因子，0.734 覆盖会使其变宽并可能误折行
         if entity.dxftype() == "MTEXT":
             if "\\W" not in raw:
                 entity.dxf.text = f"\\W{factor};" + raw
@@ -615,8 +656,12 @@ def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
         raw = mtext_data.default_content
         if not raw or not _contains_cjk(raw):
             continue
-        if "\\W" not in raw:
-            mtext_data.default_content = f"\\W{factor};" + raw
+        if "\\W" in raw:
+            continue
+        style = doc.entitydb.get(mtext_data.style_handle)
+        if style is not None and not math.isclose(float(style.dxf.get("width", 1.0)), 1.0):
+            continue
+        mtext_data.default_content = f"\\W{factor};" + raw
 
 
 # 匹配 MTEXT 文本开头的宽度因子前缀 ``\W<factor>;``（由 :func:`_remap_cjk_text_width` 添加）。
@@ -1003,7 +1048,12 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
 
     这里直接对几何块内的文字实体应用与普通文字相同的重映射链（解码 \\M+、展开
     %%c/%%d/%%p、替换缺字形、剥离内联字体），保证直径/度/正负符号正确渲染。
+
+    另外，带 ``\\S`` 公差堆叠的纯西文文字会重指到内置等宽字体（见
+    :func:`_ensure_mono_style`）：思源宋体的 TrueType 度量会让 ezdxf 把公差分数
+    拆成两行、下偏差丢失（"公差换行"），等宽字体渲染正常。
     """
+    mono_style_name: str | None = None
     for layout in doc.layouts:
         for entity in layout:
             if not isinstance(entity, Dimension):
@@ -1025,6 +1075,10 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
                 new = _INLINE_FONT_RE.sub("", new)
                 if new != raw:
                     block_entity.dxf.text = new
+                if block_entity.dxftype() == "MTEXT" and "\\S" in new and not _contains_cjk(new):
+                    if mono_style_name is None:
+                        mono_style_name = _ensure_mono_style(doc)
+                    block_entity.dxf.style = mono_style_name
 
 
 def _remap_dimension_properties(doc: ezdxf.document.Drawing) -> None:
