@@ -598,53 +598,31 @@ def _remap_mtext_inline_fonts(doc: ezdxf.document.Drawing) -> None:
             entity.dxf.text = new
 
 
-def _entity_width_factor(entity: DXFGraphic, doc: ezdxf.document.Drawing) -> float:
-    """返回文字实体的有效宽度因子，1.0 表示无自定义宽度因子。
-
-    MTEXT 的宽度因子来自样式（其组码 41 是框宽、不是宽度因子，内联 ``\\W`` 由调用方
-    单独判断）；TEXT/ATTRIB/ATTDEF 的宽度因子优先取实体 ``dxf.width``，为默认值 1.0 时
-    回退到样式。用于判断 0.734 的 SHX 补偿是否应跳过（已有自定义宽度因子时不应覆盖）。
-    """
-    style_name = entity.dxf.get("style", "") or "Standard"
-    style = doc.styles.get(style_name)
-    style_width = float(style.dxf.get("width", 1.0)) if style is not None else 1.0
-    if entity.dxftype() == "MTEXT":
-        return style_width
-    entity_width = float(entity.dxf.get("width", 1.0))
-    if not math.isclose(entity_width, 1.0):
-        return entity_width
-    return style_width
-
-
 def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
-    """把含中文的文字实体宽度因子压窄回 SHX 大字体宽度。
+    """把含中文的文字实体宽度因子压窄回 SHX 大字体宽度（固定 0.734，不叠加样式因子）。
 
     ezdxf 不支持 SHX 中文大字体（gbcbig/hztxt），中文用内置思源宋体（TrueType）替代。
     TrueType 的 cap_height 约 0.734em，中文字符（1.0em 全宽）渲染宽度是字高的 1/0.734 ≈
     1.36 倍；而 SHX 大字体中文字符宽度 = 1.0 字高。为对齐 SHX 原图、避免中文标注比原图
-    宽约 36% 而挤到相邻的序号圈/尺寸线，这里把含中文文字的宽度因子压窄到
-    ``0.734 × 有效宽度因子``。
+    宽约 36%，这里对含中文的文字统一把宽度因子设为 0.734（中文回落到 1.0 字高）。
 
     只处理**含中文**的文字：纯西文（尺寸数字、序号等）宽度因子保持 1.0 不受影响。同一段
     含中文的文字里的西文/数字也会被压窄约 26%，属于可接受的权衡。
 
-    **为什么要把样式宽度因子也乘进去**：ezdxf 的 MTEXT 渲染器（``ComplexMTextRenderer``）
-    的 ``MTextContext.width_factor`` 默认 1.0、只认内联 ``\\W``，**忽略文字样式的宽度因子**；
-    TEXT 渲染同理（``FontFace`` 不带样式宽度因子、``dxf.width`` 默认 1.0）。故含自定义样式
-    宽度因子（如宋体/标准 0.707）的中文若不加 ``\\W``，会按 1.0 渲染得比 CAD 原图宽、超框
-    折行（数车2[1] 的「镀前螺纹参数」第一行被拆成两行）。这里用 ``0.734 × 有效宽度因子``
-    作总因子显式写回（MTEXT 用内联 ``\\W``，TEXT 用 ``dxf.width``）。
+    **不叠加样式宽度因子**：ezdxf 的 MTEXT/TEXT 渲染器都忽略文字样式的宽度因子（默认
+    1.0），若把样式因子（如宋体/标准 0.707）乘进 0.734 写成 0.519，中文会被压到 0.707 字高、
+    比正常 1.0 字高窄约 30%、观感明显「扁」。样式因子主要针对西文/ASCII，不应叠加到中文上，
+    故这里只用固定的 0.734（中文 → 1.0 字高）。
     """
     for entity in _iter_text_entities(doc):
         raw = entity.dxf.get("text", "")
         if not raw or not _contains_cjk(raw):
             continue
-        total_factor = _CJK_WIDTH_FACTOR * _entity_width_factor(entity, doc)
         if entity.dxftype() == "MTEXT":
             if "\\W" not in raw:
-                entity.dxf.text = f"\\W{total_factor:g};" + raw
+                entity.dxf.text = f"\\W{_CJK_WIDTH_FACTOR:g};" + raw
         else:  # TEXT / ATTRIB / ATTDEF
-            entity.dxf.width = total_factor
+            entity.dxf.width = _CJK_WIDTH_FACTOR
 
     # MULTILEADER 内容 MTEXT 不在这上面的 _iter_text_entities 覆盖范围，单独处理。
     for entity in _iter_mleaders(doc):
@@ -656,10 +634,7 @@ def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
             continue
         if "\\W" in raw:
             continue
-        style = doc.entitydb.get(mtext_data.style_handle)
-        style_width = float(style.dxf.get("width", 1.0)) if style is not None else 1.0
-        total_factor = _CJK_WIDTH_FACTOR * style_width
-        mtext_data.default_content = f"\\W{total_factor:g};" + raw
+        mtext_data.default_content = f"\\W{_CJK_WIDTH_FACTOR:g};" + raw
 
 
 # 匹配 MTEXT 文本开头的宽度因子前缀 ``\W<factor>;``（由 :func:`_remap_cjk_text_width` 添加）。
@@ -733,19 +708,20 @@ _WRAP_OVERFLOW_TOLERANCE = 1.30
 
 
 def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
-    """对齐含中文 MTEXT 的折行：超宽者按框宽折行，无框宽者显式写单行宽度。
+    """对齐含中文 MTEXT 的折行：超宽者按框宽折行，无框宽者显式写最长行宽度。
 
     ezdxf 的 MTEXT 自动换行只按空格/单词边界折行，不拆分无空格的中文长串；当 CAD 里中文
     靠 MTEXT 框宽（width）自动折行时，ezdxf 会单行溢出（变一行）。这里在渲染前按框宽逐字
     折行（CJK 逐字、西文连续段整体），插入 ``\\P`` 对齐 CAD 的折行效果。
 
     无框宽约束（width=0，CAD 里单行）的 MTEXT：ezdxf 走 ``estimate_mtext_extents`` 估算
-    框宽，该估算对含 ``\\W`` 内联码的中文偏小，会把本应单行的文字误折成两行。这里按内置
-    中文字体量出单行宽度后显式写入 width，绕开估算（见函数体 width<=0 分支）。
+    框宽，而该估算按**样式宽度因子**（如 0.707）测量，比 :func:`_remap_cjk_text_width` 施加
+    的 ``\\W0.734`` 窄约 4%，会把本应单行的文字（含已有 ``\\P`` 的多行文字）误折成多一行。
+    这里按内置中文字体量出**最长行**的宽度后显式写入 width，绕开估算（含 ``\\P`` 时按各段取
+    最大），保证不折（加 1% 余量防浮点误差）。
 
-    只处理**纯文本**（无内联格式码、无已有换行）的 MTEXT；宽度按
-    :func:`_remap_cjk_text_width` 施加的 0.734 宽度因子折算（框宽除以 0.734 换回未压窄的
-    测量宽度）。
+    宽度按 :func:`_remap_cjk_text_width` 施加的 0.734 宽度因子折算（框宽除以 0.734 换回
+    未压窄的测量宽度）。
     """
     font_face = ezdxf_fonts.font_manager.get_font_face(_OPEN_CJK_FONT)
     renderer = UnifiedTextRenderer()
@@ -764,20 +740,21 @@ def _remap_cjk_text_width_wrap(doc: ezdxf.document.Drawing) -> None:
         if match is not None:
             prefix = match.group(0)
             raw = raw[match.end():]
-        # 含内联格式码或已有换行（\P）的跳过，避免折行破坏格式/手动换行。
-        if _MTEXT_FORMAT_RE.search(raw) or "\\P" in raw:
-            continue
 
         def measure(text: str, _ch: float = char_height) -> float:
             return renderer.get_text_line_width(text, font_face, _ch)
 
         width = entity.dxf.get("width", 0.0)
         if width <= 0:
-            # 无框宽约束（CAD 里单行，width 组码 41 为 0）：ezdxf 会走
-            # ``estimate_mtext_extents`` 估算框宽，而它对含 ``\W`` 内联码的中文估算偏小，
-            # 导致本应单行的文字被误折成两行。这里按内置中文字体量出单行宽度后显式写入
-            # width，绕开不准确的估算，保证单行不折（加 1% 余量防浮点误差）。
-            entity.dxf.width = measure(raw) * _CJK_WIDTH_FACTOR * 1.01
+            # 无框宽约束（width=0）：ezdxf 走 estimate_mtext_extents 按样式因子估算框宽，
+            # 与 \W0.734 不一致（0.734 > 0.707 样式因子），本应单行/已有 \P 换行的文字会被
+            # 误折行。显式写「最长行」宽度绕开估算（含 \P 按各段取最大）。
+            lines = raw.split("\\P")
+            entity.dxf.width = max(measure(line) for line in lines) * _CJK_WIDTH_FACTOR * 1.01
+            continue
+
+        # 含内联格式码或已有换行（\P）的跳过，避免折行破坏格式/手动换行。
+        if _MTEXT_FORMAT_RE.search(raw) or "\\P" in raw:
             continue
 
         # 压窄后框宽换算回未压窄的测量宽度（0.734 宽度因子）。

@@ -1002,13 +1002,12 @@ def test_remap_cjk_text_width_text_factor() -> None:
     assert texts[1].dxf.width == 1.0, texts[1].dxf.width
 
 
-def test_remap_cjk_text_width_multiplies_custom_style_factor() -> None:
-    r"""样式带自定义宽度因子（如 0.707）时，应写 ``\W{0.734×因子};`` 而非跳过。
+def test_remap_cjk_text_width_ignores_style_factor() -> None:
+    r"""含中文的 MTEXT 无论样式宽度因子如何，都统一写 ``\W0.734;``，不叠加样式因子。
 
-    回归：ezdxf 的 MTEXT 渲染器忽略文字样式的宽度因子（``MTextContext.width_factor``
-    默认 1.0、只认内联 ``\W``），含自定义样式宽度因子（如宋体 0.707）的中文若不加
-    ``\W`` 会按 1.0 渲染、比 CAD 原图宽而超框折行（数车2[1] 的「镀前螺纹参数」第一行
-    被拆成两行）。这里应把 0.734 × 0.707 ≈ 0.5189 作为总因子写入。
+    回归：ezdxf 的 MTEXT/TEXT 渲染器忽略文字样式的宽度因子，若把样式因子（如宋体 0.707）
+    乘进 0.734 写成 0.519，中文会被压到 0.707 字高、比正常 1.0 字高窄约 30%、观感「扁」。
+    样式因子主要针对西文，不应叠加到中文上，故统一用 0.734（中文回落到 1.0 字高）。
     """
     import ezdxf
 
@@ -1023,8 +1022,8 @@ def test_remap_cjk_text_width_multiplies_custom_style_factor() -> None:
     _remap_cjk_text_width(doc)
 
     texts = list(msp)
-    # 0.734 × 0.707 ≈ 0.518938
-    assert texts[0].text.startswith("\\W0.5189"), texts[0].text
+    # 样式 0.707 与默认 1.0 都统一写 \W0.734;（不叠加样式因子）
+    assert texts[0].text.startswith("\\W0.734;"), texts[0].text
     assert texts[1].text.startswith("\\W0.734;"), texts[1].text
 
 
