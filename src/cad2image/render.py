@@ -178,6 +178,19 @@ class _SafeRenderBackend(pymupdf.PyMuPdfRenderBackend):
         self.finish_filling(shape, properties)
         shape.commit()
 
+    def get_pixmap(self, dpi: int, alpha: bool = False) -> object:
+        """把 pixmap 的 DPI 元数据重置为 72 后再返回。
+
+        PyMuPDF 1.24.11 的 ``Pixmap.tobytes("png")`` 会按 ``pixmap 的 DPI / 72`` 对像素
+        降采样（如 dpi=289 时 2128px 被降成 531px），导致 ``--resolution`` 高 DPI 输出被
+        静默缩小、线宽变粗（尤其小图纸在 ``--resolution`` 下换算出的 dpi 很高）。把 DPI
+        元数据设回 72 后 ``tobytes`` 不再缩放，像素尺寸保持 ``get_pixmap(dpi=...)`` 的
+        原始结果。
+        """
+        pixmap = super().get_pixmap(dpi, alpha)
+        pixmap.set_dpi(72, 72)  # type: ignore[attr-defined]
+        return pixmap
+
 
 class _SafePyMuPdfBackend(pymupdf.PyMuPdfBackend):
     """返回使用 :class:`_SafeRenderBackend` 的 PyMuPDF 后端。"""
@@ -531,22 +544,6 @@ def _contains_cjk(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
 
-def _ensure_mono_style(doc: ezdxf.document.Drawing) -> str:
-    """返回一个指向内置等宽字体的样式名，不存在则创建。
-
-    用于把 DIMENSION 几何块里带 ``\\S`` 公差堆叠的纯西文文字重指到等宽字体：内置
-    思源宋体（SourceHanSerifSC）的 TrueType 度量会让 ezdxf 把公差分数（fraction）
-    渲染错位——上下偏差被拆成两行、下偏差丢失。等宽 NotoSansMono 渲染正常，且
-    ``\\S`` 公差堆叠的上下偏差恒为数字/符号（无 CJK），落到等宽字体不会方框。
-    """
-    for style in doc.styles:
-        if style.dxf.get("font", "") == _OPEN_MONO_FONT:
-            return str(style.dxf.name)
-    name = "_cad2image_mono"
-    doc.styles.add(name, font=_OPEN_MONO_FONT)
-    return name
-
-
 def _remap_cjk_text_styles(doc: ezdxf.document.Drawing) -> None:
     """把含中文但样式字体非中文字体的文字实体，重指到内置中文字体样式。
 
@@ -620,33 +617,34 @@ def _entity_width_factor(entity: DXFGraphic, doc: ezdxf.document.Drawing) -> flo
 
 
 def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
-    """把含中文的文字实体宽度因子设为 0.734，压窄回 SHX 大字体宽度。
+    """把含中文的文字实体宽度因子压窄回 SHX 大字体宽度。
 
     ezdxf 不支持 SHX 中文大字体（gbcbig/hztxt），中文用内置思源宋体（TrueType）替代。
     TrueType 的 cap_height 约 0.734em，中文字符（1.0em 全宽）渲染宽度是字高的 1/0.734 ≈
     1.36 倍；而 SHX 大字体中文字符宽度 = 1.0 字高。为对齐 SHX 原图、避免中文标注比原图
-    宽约 36% 而挤到相邻的序号圈/尺寸线，这里对含中文的文字把宽度因子设为 0.734。
+    宽约 36% 而挤到相邻的序号圈/尺寸线，这里把含中文文字的宽度因子压窄到
+    ``0.734 × 有效宽度因子``。
 
     只处理**含中文**的文字：纯西文（尺寸数字、序号等）宽度因子保持 1.0 不受影响。同一段
     含中文的文字里的西文/数字也会被压窄约 26%，属于可接受的权衡。
 
-    跳过**已带自定义宽度因子**（≠1.0，如 CAD 里样式宽 0.707）的文字：内联 ``\\W`` 会覆盖
-    样式宽度因子，若 0.734 > 原因子会令文字变宽——在 width=0 的 MTEXT 里，框宽按样式因子
-    估算（``estimate_mtext_extents`` 用 ``style.make_font``），而实际排版按内联 ``\\W0.734``，
-    两者不一致会把本应单行或已有手动换行（``\\P``）的文字误折行。
+    **为什么要把样式宽度因子也乘进去**：ezdxf 的 MTEXT 渲染器（``ComplexMTextRenderer``）
+    的 ``MTextContext.width_factor`` 默认 1.0、只认内联 ``\\W``，**忽略文字样式的宽度因子**；
+    TEXT 渲染同理（``FontFace`` 不带样式宽度因子、``dxf.width`` 默认 1.0）。故含自定义样式
+    宽度因子（如宋体/标准 0.707）的中文若不加 ``\\W``，会按 1.0 渲染得比 CAD 原图宽、超框
+    折行（数车2[1] 的「镀前螺纹参数」第一行被拆成两行）。这里用 ``0.734 × 有效宽度因子``
+    作总因子显式写回（MTEXT 用内联 ``\\W``，TEXT 用 ``dxf.width``）。
     """
-    factor = f"{_CJK_WIDTH_FACTOR}"
     for entity in _iter_text_entities(doc):
         raw = entity.dxf.get("text", "")
         if not raw or not _contains_cjk(raw):
             continue
-        if not math.isclose(_entity_width_factor(entity, doc), 1.0):
-            continue  # 已有自定义宽度因子，0.734 覆盖会使其变宽并可能误折行
+        total_factor = _CJK_WIDTH_FACTOR * _entity_width_factor(entity, doc)
         if entity.dxftype() == "MTEXT":
             if "\\W" not in raw:
-                entity.dxf.text = f"\\W{factor};" + raw
+                entity.dxf.text = f"\\W{total_factor:g};" + raw
         else:  # TEXT / ATTRIB / ATTDEF
-            entity.dxf.width = _CJK_WIDTH_FACTOR
+            entity.dxf.width = total_factor
 
     # MULTILEADER 内容 MTEXT 不在这上面的 _iter_text_entities 覆盖范围，单独处理。
     for entity in _iter_mleaders(doc):
@@ -659,9 +657,9 @@ def _remap_cjk_text_width(doc: ezdxf.document.Drawing) -> None:
         if "\\W" in raw:
             continue
         style = doc.entitydb.get(mtext_data.style_handle)
-        if style is not None and not math.isclose(float(style.dxf.get("width", 1.0)), 1.0):
-            continue
-        mtext_data.default_content = f"\\W{factor};" + raw
+        style_width = float(style.dxf.get("width", 1.0)) if style is not None else 1.0
+        total_factor = _CJK_WIDTH_FACTOR * style_width
+        mtext_data.default_content = f"\\W{total_factor:g};" + raw
 
 
 # 匹配 MTEXT 文本开头的宽度因子前缀 ``\W<factor>;``（由 :func:`_remap_cjk_text_width` 添加）。
@@ -1049,11 +1047,17 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
     这里直接对几何块内的文字实体应用与普通文字相同的重映射链（解码 \\M+、展开
     %%c/%%d/%%p、替换缺字形、剥离内联字体），保证直径/度/正负符号正确渲染。
 
-    另外，带 ``\\S`` 公差堆叠的纯西文文字会重指到内置等宽字体（见
-    :func:`_ensure_mono_style`）：思源宋体的 TrueType 度量会让 ezdxf 把公差分数
-    拆成两行、下偏差丢失（"公差换行"），等宽字体渲染正常。
+    另外，带 ``\\S`` 公差堆叠的纯西文文字会显式重指到内置中文字体样式（思源宋体，
+    见 :func:`_ensure_cjk_style`），让公差上下偏差与主尺寸数字统一用思源宋体渲染。
+
+    ``\\S`` 本身是分数堆叠（非换行），但这类 MTEXT 的 ``width`` 组码为 0 时，ezdxf
+    的 ``defined_width`` 会用 ``estimate_mtext_extents``（走 ``fast_plain_mtext``，
+    剥离 ``\\S`` 内联码、把上下偏差当普通字符串起来）来估算换行边界；思源宋体字形比
+    等宽字体宽，实际文字宽度超过该低估的边界 → 公差上下偏差被**折到主尺寸数字的下一行**
+    （"公差换行"）。故这里除重指样式外，再设一个远大于实际宽度的 ``width`` 关闭自动换行，
+    使公差保持紧凑堆叠。
     """
-    mono_style_name: str | None = None
+    cjk_style_name: str | None = None
     for layout in doc.layouts:
         for entity in layout:
             if not isinstance(entity, Dimension):
@@ -1076,9 +1080,12 @@ def _remap_dimension_geometry_texts(doc: ezdxf.document.Drawing) -> None:
                 if new != raw:
                     block_entity.dxf.text = new
                 if block_entity.dxftype() == "MTEXT" and "\\S" in new and not _contains_cjk(new):
-                    if mono_style_name is None:
-                        mono_style_name = _ensure_mono_style(doc)
-                    block_entity.dxf.style = mono_style_name
+                    if cjk_style_name is None:
+                        cjk_style_name = _ensure_cjk_style(doc)
+                    block_entity.dxf.style = cjk_style_name
+                    # 关闭自动换行：公差文字很短（直径 + 上下偏差），100×字高远大于
+                    # 实际宽度，避免 width=0 时 ezdxf 用低估的估算宽度折行。
+                    block_entity.dxf.width = block_entity.dxf.get("char_height", 2.5) * 100.0
 
 
 def _remap_dimension_properties(doc: ezdxf.document.Drawing) -> None:

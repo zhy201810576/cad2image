@@ -19,6 +19,23 @@ def test_render_to_png(sample_dxf: Path, tmp_path: Path) -> None:
     assert output.stat().st_size > 0
 
 
+def test_render_resolution_output_not_downscaled(sample_dxf: Path, tmp_path: Path) -> None:
+    """--resolution 高 DPI 输出不应被 PyMuPDF tobytes 降采样。
+
+    回归：PyMuPDF 1.24.11 的 ``Pixmap.tobytes("png")`` 按 ``pixmap 的 DPI / 72`` 对像素
+    降采样；小图在 ``--resolution`` 下换算出的 dpi 很高（如 2048/100mm≈520），长边像素
+    会被从 2048 静默降到约 300、线宽变粗。这里校验输出长边像素约等于目标分辨率。
+    """
+    import fitz
+
+    output = tmp_path / "out.png"
+    render_dxf(sample_dxf, output, RenderOptions(dpi=100, resolution=2048))
+    page = fitz.open(str(output))[0]
+    raw = page.get_pixmap()
+    # 内容长边约 100mm → 目标 2048px；被降采样时会跌到 ~300px。
+    assert max(raw.width, raw.height) > 1800
+
+
 def test_render_to_svg(sample_dxf: Path, tmp_path: Path) -> None:
     """合成 DXF 渲染为 SVG，内容为合法 XML 且编码声明为 utf-8。"""
     output = tmp_path / "out.svg"
@@ -442,15 +459,18 @@ def test_remap_dimension_geometry_texts() -> None:
     assert any("Ø" in t and "%%C" not in t and "\\F" not in t for t in after), after
 
 
-def test_remap_dimension_tolerance_stack_to_mono_font() -> None:
-    """带 \\S 公差堆叠的 DIMENSION 几何块 MTEXT 应重指到等宽字体，避免公差换行。
+def test_remap_dimension_tolerance_stack_to_cjk_font() -> None:
+    """带 \\S 公差堆叠的 DIMENSION 几何块 MTEXT 应重指到思源宋体并关闭自动换行。
 
-    回归：思源宋体（SourceHanSerifSC）的 TrueType 度量会让 ezdxf 把公差分数
-    （``\\S+0.02^  0``）拆成两行、下偏差丢失；等宽 NotoSansMono 渲染正常。
+    回归：``\\S`` 是分数堆叠（非换行），思源宋体也能正确紧凑堆叠上下偏差；重指到
+    思源宋体让公差上下偏差与主尺寸数字字体一致（而非用等宽 NotoSansMono 造成观感
+    割裂）。同时要显式设一个足够大的 ``width``——width=0 时 ezdxf 用
+    ``estimate_mtext_extents``（剥离 ``\\S`` 后低估宽度）当换行边界，思源宋体字形较宽
+    会把公差上下偏差折到主尺寸下一行。
     """
     import ezdxf
 
-    from cad2image.render import _OPEN_MONO_FONT, _remap_dimension_geometry_texts
+    from cad2image.render import _OPEN_CJK_FONT, _remap_dimension_geometry_texts
 
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
@@ -467,7 +487,9 @@ def test_remap_dimension_tolerance_stack_to_mono_font() -> None:
         if entity.dxftype() == "MTEXT" and "\\S" in entity.dxf.get("text", ""):
             style = doc.styles.get(entity.dxf.get("style"))
             assert style is not None
-            assert style.dxf.get("font") == _OPEN_MONO_FONT, style.dxf.get("font")
+            assert style.dxf.get("font") == _OPEN_CJK_FONT, style.dxf.get("font")
+            # 设了足够大的 width 关闭自动换行（> 字高的 10 倍即可）。
+            assert entity.dxf.get("width", 0.0) > entity.dxf.get("char_height", 0.0) * 10
 
 
 def test_remap_dimension_properties() -> None:
@@ -980,13 +1002,13 @@ def test_remap_cjk_text_width_text_factor() -> None:
     assert texts[1].dxf.width == 1.0, texts[1].dxf.width
 
 
-def test_remap_cjk_text_width_skips_custom_width_factor() -> None:
-    r"""样式已带自定义宽度因子（≠1.0）时，不应再用 ``\W0.734`` 覆盖。
+def test_remap_cjk_text_width_multiplies_custom_style_factor() -> None:
+    r"""样式带自定义宽度因子（如 0.707）时，应写 ``\W{0.734×因子};`` 而非跳过。
 
-    回归：CAD 里样式宽度因子（如 0.707）是作者按字体自然宽度调好的；内联 ``\W`` 会覆盖
-    样式因子，若 0.734 > 0.707 会令文字变宽——在 width=0 的 MTEXT 里，框宽按样式因子估算
-    （``estimate_mtext_extents`` 用 ``style.make_font``）而实际排版按 ``\W0.734``，两者不一致
-    会把本应单行或已有 ``\P`` 手动换行的文字误折行。
+    回归：ezdxf 的 MTEXT 渲染器忽略文字样式的宽度因子（``MTextContext.width_factor``
+    默认 1.0、只认内联 ``\W``），含自定义样式宽度因子（如宋体 0.707）的中文若不加
+    ``\W`` 会按 1.0 渲染、比 CAD 原图宽而超框折行（数车2[1] 的「镀前螺纹参数」第一行
+    被拆成两行）。这里应把 0.734 × 0.707 ≈ 0.5189 作为总因子写入。
     """
     import ezdxf
 
@@ -1001,8 +1023,8 @@ def test_remap_cjk_text_width_skips_custom_width_factor() -> None:
     _remap_cjk_text_width(doc)
 
     texts = list(msp)
-    assert "\\W0.734;" not in texts[0].text, texts[0].text
-    assert texts[0].text.startswith("安装9-ST5"), texts[0].text
+    # 0.734 × 0.707 ≈ 0.518938
+    assert texts[0].text.startswith("\\W0.5189"), texts[0].text
     assert texts[1].text.startswith("\\W0.734;"), texts[1].text
 
 
