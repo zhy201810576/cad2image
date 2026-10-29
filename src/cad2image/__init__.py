@@ -31,4 +31,4 @@ __all__ = [
     "render_to_svg",
 ]
 
-__version__ = "0.1.32"
+__version__ = "0.1.33"

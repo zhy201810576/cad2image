@@ -9,6 +9,7 @@ SVG 走 ezdxf SVG 后端。渲染流程：
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
 import threading
@@ -24,17 +25,21 @@ from ezdxf import bbox
 from ezdxf.addons.drawing import Frontend, RenderContext, pymupdf
 from ezdxf.addons.drawing import layout as layout_module
 from ezdxf.addons.drawing.backend import BackendProperties, NumpyPoints2d
+from ezdxf.addons.drawing.properties import Properties
 from ezdxf.addons.drawing.svg import SVGBackend
 from ezdxf.addons.drawing.unified_text_renderer import UnifiedTextRenderer
-from ezdxf.entities import Dimension, DXFGraphic, Leader, LWPolyline, MultiLeader, OLE2Frame
+from ezdxf.entities import Dimension, DXFGraphic, Leader, LWPolyline, MultiLeader, OLE2Frame, Spline
 from ezdxf.enums import TextEntityAlignment
 from ezdxf.fonts import fonts as ezdxf_fonts
 from ezdxf.layouts import BlockLayout, Layout
 from ezdxf.math import BoundingBox2d, Vec2, Vec3, intersection_line_line_2d
+from ezdxf.path import make_path
 
 from cad2image.config import RenderOptions, build_drawing_configuration
 
 _SUPPORTED_IMAGE_FORMATS = {".png"}
+
+_LOGGER = logging.getLogger(__name__)
 
 # 匹配 XML 声明中的 encoding 属性，用于归一化为 utf-8。
 _XML_ENCODING_RE = re.compile(r"(encoding=)['\"][^'\"]*['\"]")
@@ -200,6 +205,33 @@ class _SafePyMuPdfBackend(pymupdf.PyMuPdfBackend):
         return _SafeRenderBackend(page, settings)
 
 
+class _SafeFrontend(Frontend):
+    """跳过几何数据非法的曲线实体（退化 SPLINE 等），不中断整图渲染。
+
+    ezdxf 对 SPLINE/CIRCLE/ARC/ELLIPSE 统一走 ``make_path`` 构造路径再绘制；第三方
+    工具（如 ODA File Converter）产出的退化 SPLINE（degree≤0、控制点数少于阶数、
+    全零 knot、degree 超出 C 扩展上限）会让 ``BSpline``/``Basis`` 抛
+    ValueError/ZeroDivisionError。上游 ``Frontend.draw_entity`` 对顶层实体无任何
+    保护，一张图里有一个坏实体整次转换就失败。这里按实体捕获并跳过（仅告警），
+    让其余内容照常渲染。
+
+    可修复的 SPLINE（控制点≥2）已在 :func:`_remap_degenerate_splines_to_graphics`
+    中退化为控制点折线，本类是最后一道安全网，处理无法修复的实体（如无控制点的
+    样条）。
+    """
+
+    def draw_curve_entity(self, entity: DXFGraphic, properties: Properties) -> None:
+        try:
+            super().draw_curve_entity(entity, properties)
+        except (ValueError, TypeError, ZeroDivisionError) as exc:
+            _LOGGER.warning(
+                "跳过几何数据非法的 %s 实体（handle=%s）：%s",
+                entity.dxftype(),
+                entity.dxf.handle,
+                exc,
+            )
+
+
 # 线程安全：``_defer_content_wrap`` 会临时替换进程级全局的 ``fitz.Page.wrap_contents``。
 # 用引用计数 + 锁让并发渲染共享同一补丁：首个进入者捕获原实现并打补丁，最后一个退出者
 # 恢复原实现；中间并发进入者只递增计数，互不干扰，使同进程多线程并发渲染成为可能。
@@ -296,6 +328,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_properties(doc)
     _remap_leader_dimension_to_graphics(doc)
     _remap_wide_polyline_to_graphics(doc)
+    _remap_degenerate_splines_to_graphics(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
@@ -310,7 +343,7 @@ def render_to_png(dxf_path: str | Path, output_path: str | Path, options: Render
 
     context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
     backend = _SafePyMuPdfBackend()
-    Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    _SafeFrontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
     # 用实际渲染内容（已排除 invisible/隐藏实体）确定页面，避免离群实体撑大页面、图形缩小。
     page = _determine_page(dxf_layout, options, backend.player().bbox())
     settings = _build_render_settings(options)
@@ -356,6 +389,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
     _remap_dimension_properties(doc)
     _remap_leader_dimension_to_graphics(doc)
     _remap_wide_polyline_to_graphics(doc)
+    _remap_degenerate_splines_to_graphics(doc)
     _clear_mleader_proxy_graphics(doc)
     _remap_mleader_properties(doc)
     _remap_mleader_text(doc)
@@ -369,7 +403,7 @@ def render_to_svg(dxf_path: str | Path, output_path: str | Path, options: Render
 
     context = RenderContext(doc, ctb=_validate_ctb(options.ctb))
     backend = SVGBackend()
-    Frontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
+    _SafeFrontend(context, backend, config=drawing_config).draw_layout(dxf_layout, finalize=True)
     # 用实际渲染内容（已排除 invisible/隐藏实体）确定页面，避免离群实体撑大页面、图形缩小。
     page = _determine_page(dxf_layout, options, backend.player().bbox())
     settings = _build_render_settings(options)
@@ -1187,6 +1221,45 @@ def _remap_wide_polyline_to_graphics(doc: ezdxf.document.Drawing) -> None:
         block.delete_entity(entity)
 
 
+def _remap_degenerate_splines_to_graphics(doc: ezdxf.document.Drawing) -> None:
+    """把无法构造曲线的 SPLINE 退化为控制点折线（LWPolyline）。
+
+    ODA File Converter 等工具会输出 ezdxf 无法构造的 SPLINE：
+    - degree 超出 C 扩展上限（实测 ``Basis`` 阶数上限 11，即 degree≤10；真实图纸里
+      degree=11 的 11 次 Bézier 形直线样条抛 "invalid order"）；
+    - degree≤0、控制点数少于阶数（DXFValueError）；
+    - knot 向量全零（零跨度，构造时除零 ZeroDivisionError）。
+
+    这些实体大多带 linear 标志（flags bit 16，控制点间直线连接），本质就是控制点
+    折线，退化为 LWPolyline 是忠实呈现；其余坏数据按控制多边形退化呈现（与
+    ``bbox.extents(fast=True)`` 同语义），保证几何可见而非整图跳过。
+
+    控制点少于 2 个的 SPLINE 无法退化，保留原样交由 :class:`_SafeFrontend` 在渲染
+    时跳过并告警。
+    """
+    targets: list[tuple[BlockLayout, Spline]] = []
+    for block in doc.blocks:
+        for entity in block:
+            if not isinstance(entity, Spline) or len(entity.control_points) < 2:
+                continue
+            try:
+                make_path(entity)
+            except (ValueError, TypeError, ZeroDivisionError):
+                targets.append((block, entity))
+
+    for block, entity in targets:
+        attribs: dict[str, object] = {
+            "layer": entity.dxf.layer,
+            "color": entity.dxf.color,
+            "linetype": entity.dxf.linetype,
+        }
+        polyline = block.add_lwpolyline(
+            [(float(p[0]), float(p[1])) for p in entity.control_points], dxfattribs=attribs
+        )
+        polyline.closed = entity.closed
+        block.delete_entity(entity)
+
+
 def _clear_mleader_proxy_graphics(doc: ezdxf.document.Drawing) -> None:
     """清除 MULTILEADER 实体的代理图形（proxy graphic），强制走原生渲染。
 
@@ -1714,6 +1787,38 @@ _AUTO_LW_REFERENCE_MM = 0.3
 _AUTO_LW_REFERENCE_PX = 2.0
 
 
+def _safe_layout_extents(dxf_layout: Layout, *, fast: bool = True) -> BoundingBox2d:
+    """计算布局包围盒，容忍个别几何数据非法的实体（退化 SPLINE 等）。
+
+    ``bbox.extents`` 对曲线实体走 ``make_path`` 构造路径，退化 SPLINE 等坏数据会抛
+    ValueError/ZeroDivisionError（见 :class:`_SafeFrontend`）。先整图计算（正常图纸
+    零开销），失败时退化为逐实体计算并跳过坏实体，保证其余实体仍能确定范围。跳过
+    粒度是布局顶层实体：坏曲线嵌在 INSERT 内时整个 INSERT 的范围会被放弃。
+
+    Args:
+        dxf_layout: 要计算包围盒的布局。
+        fast: 传给 ``bbox.extents`` 的 ``fast`` 参数（Bézier 用控制点近似）。
+
+    Returns:
+        布局包围盒；全部实体都非法时返回空盒（``has_data`` 为 False）。
+    """
+    box = BoundingBox2d()
+    try:
+        box.extend(bbox.extents(dxf_layout, fast=fast))
+        return box
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass
+    skipped = 0
+    for entity in dxf_layout:
+        try:
+            box.extend(bbox.extents([entity], fast=fast))
+        except (ValueError, TypeError, ZeroDivisionError):
+            skipped += 1
+    if skipped:
+        _LOGGER.warning("跳过 %d 个无法计算包围盒的实体（几何数据非法）", skipped)
+    return box
+
+
 def _pixels_per_mm(options: RenderOptions, dxf_layout: Layout) -> float | None:
     """估算输出图每毫米对应的像素数，无法估算时返回 ``None``。
 
@@ -1725,7 +1830,7 @@ def _pixels_per_mm(options: RenderOptions, dxf_layout: Layout) -> float | None:
         if options.width_mm is not None and options.height_mm is not None:
             max_dim_mm = max(options.width_mm, options.height_mm)
         else:
-            extents = bbox.extents(dxf_layout, fast=True)
+            extents = _safe_layout_extents(dxf_layout)
             if not extents.has_data:
                 return None
             max_dim_mm = max(float(extents.size.x), float(extents.size.y))
@@ -1918,7 +2023,7 @@ def _page_from_extents(
         width = float(content_bbox.size.x)
         height = float(content_bbox.size.y)
     else:
-        extents = bbox.extents(dxf_layout, fast=True)
+        extents = _safe_layout_extents(dxf_layout)
         if not extents.has_data:
             raise RuntimeError("布局内容为空或包围盒无效，无法确定渲染范围")
         width = float(extents.size.x)

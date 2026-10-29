@@ -1575,3 +1575,205 @@ def test_pixels_per_mm_empty_layout_returns_none() -> None:
 
     doc = ezdxf.new("R2018")
     assert _pixels_per_mm(RenderOptions(resolution=2048), doc.modelspace()) is None
+
+
+def _make_degenerate_spline_dxf(
+    tmp_path: Path,
+    *,
+    degree: int,
+    knots: list[float],
+    ctrl_points: list[tuple[float, float]] | None = None,
+    flags: int = 8,
+    tag: str = "",
+) -> Path:
+    """构造含退化 SPLINE 与正常直线的 DXF，模拟第三方工具产出的坏文件。
+
+    ezdxf 的 ``add_spline``/``new_entity`` 会校验控制点数与 degree，退化实体无法经
+    其 API 构造，只能用原始 DXF 文本直写（与 ODA File Converter 产出的坏文件一致；
+    ezdxf 读回时不校验——崩溃发生在渲染/包围盒阶段而非解析阶段）。
+    """
+    if ctrl_points is None:
+        ctrl_points = [(0.0, 0.0), (10.0, 10.0)]
+    spline_lines = [
+        "0", "SPLINE", "5", "AA",
+        "100", "AcDbEntity", "8", "0",
+        "100", "AcDbSpline",
+        "70", str(flags),
+        "71", str(degree),
+        "72", str(len(knots)),
+        "73", str(len(ctrl_points)),
+        "74", "0",
+    ]
+    for value in knots:
+        spline_lines += ["40", repr(float(value))]
+    for x, y in ctrl_points:
+        spline_lines += ["10", repr(float(x)), "20", repr(float(y)), "30", "0.0"]
+    text = "\n".join(
+        [
+            "0", "SECTION", "2", "HEADER", "9", "$ACADVER", "1", "AC1027",
+            "0", "ENDSEC",
+            "0", "SECTION", "2", "TABLES", "0", "TABLE", "2", "LAYER", "70", "1",
+            "0", "LAYER", "2", "0", "70", "0", "62", "7", "6", "CONTINUOUS",
+            "0", "ENDTAB", "0", "ENDSEC",
+            "0", "SECTION", "2", "ENTITIES",
+            *spline_lines,
+            "0", "LINE", "5", "AB", "100", "AcDbEntity", "8", "0", "100", "AcDbLine",
+            "10", "0", "20", "0", "30", "0", "11", "100", "21", "50", "31", "0",
+            "0", "ENDSEC", "0", "EOF",
+        ]
+    ) + "\n"
+    path = tmp_path / f"degenerate_spline{tag}.dxf"
+    path.write_text(text, encoding="ascii")
+    return path
+
+
+def test_remap_degenerate_splines_to_graphics(tmp_path: Path) -> None:
+    """无法构造的 SPLINE 退化为控制点折线，正常样条保持原样。
+
+    回归真实图纸形态：ODA 输出 degree=11、12 个控制点、24 个全零 knot 的 linear
+    样条（order=12 超出 ezdxf C 扩展上限 → "invalid order"），其本质是控制点折线。
+    """
+    import ezdxf
+
+    from cad2image.render import _remap_degenerate_splines_to_graphics
+
+    ctrl_points = [(float(i) * 10.0, 0.0) for i in range(12)]
+    dxf = _make_degenerate_spline_dxf(
+        tmp_path, degree=11, knots=[0.0] * 24, ctrl_points=ctrl_points, flags=24, tag="_real"
+    )
+    doc = ezdxf.readfile(dxf)
+    msp = doc.modelspace()
+    msp.add_spline(fit_points=[(0, 0), (1, 1), (2, 0), (3, 1)])  # 正常样条，不应被转换
+
+    _remap_degenerate_splines_to_graphics(doc)
+
+    polylines = [e for e in msp if e.dxftype() == "LWPOLYLINE"]
+    splines = [e for e in msp if e.dxftype() == "SPLINE"]
+    assert len(polylines) == 1
+    assert len(splines) == 1, "退化样条应被移除，正常样条应保留"
+    assert list(polylines[0].get_points("xy")) == pytest.approx(ctrl_points)
+    assert not polylines[0].closed
+
+
+def test_remap_degenerate_closed_spline_becomes_closed_polyline(tmp_path: Path) -> None:
+    """闭合的退化样条退化为闭合折线（flags bit 1 传递）。"""
+    import ezdxf
+
+    from cad2image.render import _remap_degenerate_splines_to_graphics
+
+    dxf = _make_degenerate_spline_dxf(
+        tmp_path, degree=11, knots=[0.0] * 24, flags=25, tag="_closed"  # 1(closed)+8+16
+    )
+    doc = ezdxf.readfile(dxf)
+
+    _remap_degenerate_splines_to_graphics(doc)
+
+    polylines = [e for e in doc.modelspace() if e.dxftype() == "LWPOLYLINE"]
+    assert len(polylines) == 1
+    assert polylines[0].closed
+
+
+@pytest.mark.parametrize(
+    ("degree", "knots", "ctrl_points", "flags"),
+    [
+        (0, [0.0, 0.0, 1.0], None, 8),  # order=1 → Cython "invalid order"
+        (3, [0.0, 0.0, 1.0], None, 8),  # 控制点数 2 < order 4 → DXFValueError
+        (1, [0.0, 0.0, 0.0, 0.0], None, 8),  # 全零 knot → ZeroDivisionError
+        (11, [0.0] * 24, [(i * 10.0, 0.0) for i in range(12)], 24),  # 真实图纸形态
+    ],
+)
+def test_render_degenerate_spline_repaired(
+    degree: int,
+    knots: list[float],
+    ctrl_points: list[tuple[float, float]] | None,
+    flags: int,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """退化 SPLINE 修复为控制点折线后渲染：无跳过告警，全部内容照常输出。
+
+    回归：``bbox.extents``/``Frontend.draw_curve_entity`` 对退化 SPLINE 构造
+    ``BSpline`` 时抛 ValueError/ZeroDivisionError，一张图有一个坏实体整次转换失败。
+    """
+    import logging
+
+    import numpy as np
+    from PIL import Image
+
+    dxf = _make_degenerate_spline_dxf(
+        tmp_path, degree=degree, knots=knots, ctrl_points=ctrl_points, flags=flags, tag=f"_{degree}"
+    )
+    png = tmp_path / f"out_deg{degree}.png"
+    with caplog.at_level(logging.WARNING, logger="cad2image.render"):
+        render_dxf(dxf, png, RenderOptions(auto_lineweight_scaling=True, resolution=2048))
+    assert png.stat().st_size > 0
+    arr = np.array(Image.open(png).convert("L"))
+    assert (arr < 128).any(), "退化样条修复为折线后，连同其余内容应照常渲染"
+    assert not any("SPLINE" in record.message for record in caplog.records), "可修复的样条不应走跳过路径"
+
+
+def test_render_spline_without_control_points_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """无控制点的 SPLINE 无法修复，渲染时跳过并告警（安全网），其余内容照常输出。"""
+    import logging
+
+    import numpy as np
+    from PIL import Image
+
+    dxf = _make_degenerate_spline_dxf(
+        tmp_path, degree=3, knots=[0.0, 0.0, 1.0], ctrl_points=[], tag="_noctrl"
+    )
+    png = tmp_path / "out.png"
+    with caplog.at_level(logging.WARNING, logger="cad2image.render"):
+        render_dxf(dxf, png, RenderOptions(auto_lineweight_scaling=True, resolution=2048))
+    arr = np.array(Image.open(png).convert("L"))
+    assert (arr < 128).any(), "坏实体被跳过后，其余内容（直线）应照常渲染"
+    assert any("SPLINE" in record.message for record in caplog.records)
+
+
+def test_render_degenerate_spline_svg(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """SVG 渲染对退化 SPLINE 同样容错：修复为折线后输出合法 SVG。"""
+    import logging
+
+    dxf = _make_degenerate_spline_dxf(tmp_path, degree=0, knots=[0.0, 0.0, 1.0])
+    svg = tmp_path / "out.svg"
+    with caplog.at_level(logging.WARNING, logger="cad2image.render"):
+        render_dxf(dxf, svg, RenderOptions(auto_lineweight_scaling=True, resolution=2048))
+    content = svg.read_text(encoding="utf-8")
+    assert "<svg" in content
+
+
+def test_safe_layout_extents_skips_degenerate_spline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """_safe_layout_extents 整图失败时逐实体回退：跳过坏实体、保留其余实体范围。"""
+    import logging
+
+    import ezdxf
+
+    from cad2image.render import _safe_layout_extents
+
+    dxf = _make_degenerate_spline_dxf(tmp_path, degree=0, knots=[0.0, 0.0, 1.0])
+    doc = ezdxf.readfile(dxf)
+    with caplog.at_level(logging.WARNING, logger="cad2image.render"):
+        box = _safe_layout_extents(doc.modelspace())
+    assert box.has_data
+    assert float(box.size.x) == pytest.approx(100)
+    assert float(box.size.y) == pytest.approx(50)
+    assert any("无法计算包围盒" in record.message for record in caplog.records)
+
+
+def test_apply_auto_lineweight_scaling_tolerates_degenerate_spline(tmp_path: Path) -> None:
+    """自动线宽缩放按内容尺寸推导时，布局含退化 SPLINE 不应崩溃（生产回归路径）。"""
+    import ezdxf
+
+    from cad2image.render import _apply_auto_lineweight_scaling
+
+    dxf = _make_degenerate_spline_dxf(tmp_path, degree=0, knots=[0.0, 0.0, 1.0])
+    doc = ezdxf.readfile(dxf)
+    options = RenderOptions(auto_lineweight_scaling=True, resolution=2048)
+    scaled = _apply_auto_lineweight_scaling(options, doc.modelspace())
+    # 与 test_apply_auto_lineweight_scaling_derives_from_content_size 一致：
+    # 内容长边取直线的 100mm，坏 spline 不参与也不中断。
+    assert scaled.lineweight_scaling == pytest.approx(2.0 / (0.3 * 2048 / 100))
